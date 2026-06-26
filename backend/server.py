@@ -21,6 +21,9 @@ from auth import (
     get_current_user_factory, require_roles, seed_admin,
 )
 from po_extractor import extract_po_from_pdf, extract_po_from_xlsx
+from pdf_docs import generate_tax_invoice_pdf, generate_dispatch_challan_pdf
+from fastapi.responses import StreamingResponse
+from io import BytesIO
 
 # ---------- DB & app ----------
 mongo_url = os.environ["MONGO_URL"]
@@ -267,6 +270,7 @@ async def create_material(payload: MaterialIn, request: Request):
     doc["created_at"] = now_iso()
     doc["updated_at"] = now_iso()
     res = await db.materials.insert_one(doc)
+    doc.pop("_id", None)
     doc["id"] = str(res.inserted_id)
     return doc
 
@@ -340,6 +344,7 @@ async def create_style(payload: StyleIn, request: Request):
     doc["created_at"] = now_iso()
     doc["updated_at"] = now_iso()
     res = await db.styles.insert_one(doc)
+    doc.pop("_id", None)
     doc["id"] = str(res.inserted_id)
     doc["costing"] = compute_style_costing(doc)
     return doc
@@ -395,6 +400,7 @@ async def create_po(payload: POIn, request: Request):
     if not doc.get("subtotal"):
         doc["subtotal"] = sum(li["amount"] for li in doc["line_items"])
     res = await db.pos.insert_one(doc)
+    doc.pop("_id", None)
     doc["id"] = str(res.inserted_id)
     # auto-create production jobs (one per line item)
     jobs = []
@@ -455,6 +461,143 @@ async def extract_po(file: UploadFile = File(...), request: Request = None):
         raise HTTPException(500, f"Extraction failed: {e}")
 
 
+@api.get("/pos/{pid}/invoice.pdf")
+async def po_invoice(pid: str, request: Request):
+    await get_current_user(request)
+    doc = await db.pos.find_one({"_id": oid(pid)})
+    if not doc:
+        raise HTTPException(404, "Not found")
+    po = stringify(doc)
+    pdf_bytes = generate_tax_invoice_pdf(po)
+    return StreamingResponse(
+        BytesIO(pdf_bytes), media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="invoice-{po.get("po_number","po")}.pdf"'},
+    )
+
+
+@api.get("/pos/{pid}/challan.pdf")
+async def po_challan(pid: str, request: Request, dispatch_qty: Optional[int] = None,
+                     transporter: str = "", vehicle: str = ""):
+    await get_current_user(request)
+    doc = await db.pos.find_one({"_id": oid(pid)})
+    if not doc:
+        raise HTTPException(404, "Not found")
+    po = stringify(doc)
+    pdf_bytes = generate_dispatch_challan_pdf(po, dispatch_qty=dispatch_qty,
+                                              transporter=transporter, vehicle=vehicle)
+    return StreamingResponse(
+        BytesIO(pdf_bytes), media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="challan-{po.get("po_number","po")}.pdf"'},
+    )
+
+
+# ---------- REPORTS ----------
+@api.get("/reports/cost-variance")
+async def report_cost_variance(request: Request):
+    await get_current_user(request)
+    styles = await db.styles.find({}).to_list(1000)
+    style_costs = {}
+    for s in styles:
+        s_obj = stringify(s)
+        c = compute_style_costing(s_obj)
+        style_costs[s["code"]] = {"name": s["name"], "computed_cost": c["total_cost"], "selling_price": c["selling_price"]}
+    pos = await db.pos.find({}).to_list(1000)
+    rows = []
+    for p in pos:
+        for li in p.get("line_items", []):
+            code = li.get("style_code", "")
+            sc = style_costs.get(code, {})
+            cost = sc.get("computed_cost", 0)
+            sell = li.get("unit_price", 0)
+            variance = sell - cost
+            margin_pct = (variance / cost * 100) if cost else 0
+            rows.append({
+                "po_number": p.get("po_number"), "client": p.get("client_name"),
+                "style_code": code, "style_name": sc.get("name", "—"),
+                "computed_cost": round(cost, 2), "po_unit_price": round(sell, 2),
+                "variance": round(variance, 2), "margin_pct": round(margin_pct, 2),
+                "quantity": li.get("quantity", 0),
+                "total_variance": round(variance * li.get("quantity", 0), 2),
+            })
+    rows.sort(key=lambda r: r["margin_pct"])
+    return rows
+
+
+@api.get("/reports/stage-cycle-time")
+async def report_stage_cycle_time(request: Request):
+    await get_current_user(request)
+    jobs = await db.production_jobs.find({}).to_list(5000)
+    from collections import defaultdict
+    durations = defaultdict(list)
+    for j in jobs:
+        hist = sorted(j.get("history", []), key=lambda h: h.get("at", ""))
+        for i in range(1, len(hist)):
+            prev, cur = hist[i - 1], hist[i]
+            try:
+                t_prev = datetime.fromisoformat(prev["at"])
+                t_cur = datetime.fromisoformat(cur["at"])
+                hours = (t_cur - t_prev).total_seconds() / 3600
+                if hours >= 0:
+                    durations[(prev["stage"], cur["stage"])].append(hours)
+            except Exception:
+                continue
+    out = []
+    for (frm, to), vals in durations.items():
+        out.append({
+            "from_stage": frm, "to_stage": to, "samples": len(vals),
+            "avg_hours": round(sum(vals) / len(vals), 2),
+            "min_hours": round(min(vals), 2), "max_hours": round(max(vals), 2),
+        })
+    out.sort(key=lambda r: r["avg_hours"], reverse=True)
+    return out
+
+
+@api.get("/reports/defect-rate")
+async def report_defect_rate(request: Request):
+    await get_current_user(request)
+    defects = await db.defects.find({}).to_list(2000)
+    jobs = await db.production_jobs.find({}).to_list(5000)
+    from collections import defaultdict
+    stage_qty = defaultdict(int)
+    for j in jobs:
+        for h in j.get("history", []):
+            stage_qty[h.get("stage", "")] += j.get("quantity", 0)
+    by_stage = defaultdict(lambda: {"defective": 0, "rework": 0, "rejected": 0, "cost": 0.0, "incidents": 0})
+    by_type = defaultdict(lambda: {"defective": 0, "cost": 0.0, "incidents": 0})
+    total_defective = 0
+    total_cost = 0.0
+    for d in defects:
+        s = d.get("stage", "unknown")
+        by_stage[s]["defective"] += d.get("defective_qty", 0)
+        by_stage[s]["rework"] += d.get("rework_qty", 0)
+        by_stage[s]["rejected"] += d.get("final_rejection_qty", 0)
+        by_stage[s]["cost"] += d.get("cost", 0) or 0
+        by_stage[s]["incidents"] += 1
+        t = d.get("defect_type", "unknown")
+        by_type[t]["defective"] += d.get("defective_qty", 0)
+        by_type[t]["cost"] += d.get("cost", 0) or 0
+        by_type[t]["incidents"] += 1
+        total_defective += d.get("defective_qty", 0)
+        total_cost += d.get("cost", 0) or 0
+    stages_out = []
+    for stage, v in by_stage.items():
+        produced = stage_qty.get(stage, 0)
+        rate = (v["defective"] / produced * 100) if produced else 0
+        stages_out.append({
+            "stage": stage, "produced_qty": produced,
+            "defective_qty": v["defective"], "rework_qty": v["rework"],
+            "rejected_qty": v["rejected"], "cost": round(v["cost"], 2),
+            "incidents": v["incidents"], "defect_rate_pct": round(rate, 2),
+        })
+    stages_out.sort(key=lambda r: r["defect_rate_pct"], reverse=True)
+    types_out = [{"type": k, **v, "cost": round(v["cost"], 2)} for k, v in by_type.items()]
+    types_out.sort(key=lambda r: r["defective"], reverse=True)
+    return {
+        "by_stage": stages_out, "by_type": types_out,
+        "totals": {"total_defective": total_defective, "total_cost": round(total_cost, 2), "total_incidents": len(defects)},
+    }
+
+
 # ---------- PRODUCTION ----------
 @api.get("/production/jobs")
 async def list_jobs(request: Request):
@@ -502,6 +645,7 @@ async def create_defect(payload: DefectIn, request: Request):
     doc["created_at"] = now_iso()
     doc["updated_at"] = now_iso()
     res = await db.defects.insert_one(doc)
+    doc.pop("_id", None)
     doc["id"] = str(res.inserted_id)
     return doc
 

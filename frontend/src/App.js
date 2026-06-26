@@ -10,6 +10,7 @@ import Costing from "@/pages/Costing";
 import POs from "@/pages/POs";
 import Production from "@/pages/Production";
 import Defects from "@/pages/Defects";
+import Reports from "@/pages/Reports";
 import Users from "@/pages/Users";
 import { Loader2 } from "lucide-react";
 
@@ -41,6 +42,7 @@ function App() {
             <Route path="pos" element={<POs />} />
             <Route path="production" element={<Production />} />
             <Route path="defects" element={<Defects />} />
+            <Route path="reports" element={<Reports />} />
             <Route path="users" element={<Users />} />
           </Route>
         </Routes>

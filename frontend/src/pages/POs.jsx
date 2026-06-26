@@ -2,7 +2,9 @@ import { useEffect, useState, useMemo } from "react";
 import { http, inr } from "../lib/api";
 import { PageHeader, Card, BtnPrimary, BtnSecondary, Input, Select, Badge } from "../components/ui-kit";
 import { Drawer } from "./Materials";
-import { Plus, Upload, Trash2, Eye, Save, FileText, Loader2, Sparkles } from "lucide-react";
+import { Plus, Upload, Trash2, Eye, Save, FileText, Loader2, Sparkles, FileDown, Truck } from "lucide-react";
+
+import { API } from "../lib/api";
 
 const emptyLine = { style_code: "", description: "", color: "", size: "", hsn_code: "", quantity: 0, unit_price: 0, amount: 0 };
 const emptyPO = {
@@ -163,7 +165,9 @@ export default function POs() {
                   <td className="px-4 py-3 text-right font-mono font-bold">{inr(p.grand_total)}</td>
                   <td className="px-4 py-3 text-xs">{p.delivery_date || "—"}</td>
                   <td className="px-4 py-3 text-right">
-                    <button onClick={() => setView(p)} className="text-slate-600 hover:text-[#2563EB] p-1.5" data-testid={`view-po-${p.po_number}`}><Eye className="w-4 h-4" /></button>
+                    <a href={`${API}/pos/${p.id}/invoice.pdf`} target="_blank" rel="noreferrer" className="text-slate-600 hover:text-[#C27842] p-1.5 inline-block" title="Download Tax Invoice" data-testid={`invoice-${p.po_number}`}><FileDown className="w-4 h-4" /></a>
+                    <a href={`${API}/pos/${p.id}/challan.pdf`} target="_blank" rel="noreferrer" className="text-slate-600 hover:text-[#F97316] p-1.5 inline-block ml-1" title="Dispatch Challan" data-testid={`challan-${p.po_number}`}><Truck className="w-4 h-4" /></a>
+                    <button onClick={() => setView(p)} className="text-slate-600 hover:text-[#2563EB] p-1.5 ml-1" data-testid={`view-po-${p.po_number}`}><Eye className="w-4 h-4" /></button>
                     <button onClick={() => remove(p.id)} className="text-slate-600 hover:text-red-600 p-1.5 ml-1"><Trash2 className="w-4 h-4" /></button>
                   </td>
                 </tr>
