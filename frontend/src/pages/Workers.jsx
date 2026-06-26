@@ -20,7 +20,7 @@ const SKILL_COLOR = {
   lasting: "slate", sole_pasting: "orange", finishing: "green", general: "slate",
 };
 
-const empty = { name: "", phone: "", skill: "general", rate_per_pair: 0, active: true, notes: "" };
+const empty = { name: "", phone: "", skill: "general", rate_per_pair: 0, active: true, notes: "", bonus_pct: 0, target_cycle_days: 0 };
 
 export default function Workers() {
   const [items, setItems] = useState([]);
@@ -38,7 +38,8 @@ export default function Workers() {
   const startNew = () => { setEditId(null); setForm(empty); setOpen(true); };
   const startEdit = (w) => { setEditId(w.id); setForm({ ...empty, ...w }); setOpen(true); };
   const save = async () => {
-    const body = { ...form, rate_per_pair: Number(form.rate_per_pair || 0), active: !!form.active };
+    const body = { ...form, rate_per_pair: Number(form.rate_per_pair || 0), active: !!form.active,
+                   bonus_pct: Number(form.bonus_pct || 0), target_cycle_days: Number(form.target_cycle_days || 0) };
     if (editId) await http.patch(`/workers/${editId}`, body); else await http.post("/workers", body);
     setOpen(false); load();
   };
@@ -111,7 +112,12 @@ export default function Workers() {
             <Select label="Skill" value={form.skill} onChange={(e) => setForm({ ...form, skill: e.target.value })} testId="form-worker-skill">
               {SKILLS.map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
             </Select>
-            <Input label="Rate per pair (₹)" type="number" step="0.5" value={form.rate_per_pair} onChange={(e) => setForm({ ...form, rate_per_pair: e.target.value })} />
+            <Input label="Rate per pair (₹) – default" type="number" step="0.5" value={form.rate_per_pair} onChange={(e) => setForm({ ...form, rate_per_pair: e.target.value })} />
+            <div className="grid grid-cols-2 gap-3 pt-2 border-t border-dashed border-slate-200">
+              <Input label="Productivity Bonus %" type="number" step="0.5" value={form.bonus_pct} onChange={(e) => setForm({ ...form, bonus_pct: e.target.value })} testId="form-worker-bonus" />
+              <Input label="Target Cycle (days)" type="number" step="0.5" value={form.target_cycle_days} onChange={(e) => setForm({ ...form, target_cycle_days: e.target.value })} testId="form-worker-cycle" />
+            </div>
+            <div className="text-[10px] text-slate-500 italic">If a job is completed within Target Cycle days of assignment, karigar earns extra Bonus % on that job. Set both to 0 to disable.</div>
             <Input label="Notes" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
             <label className="flex items-center gap-2 text-sm">
               <input type="checkbox" checked={form.active} onChange={(e) => setForm({ ...form, active: e.target.checked })} className="w-4 h-4" />

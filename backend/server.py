@@ -23,6 +23,7 @@ from auth import (
 from po_extractor import extract_po_from_pdf, extract_po_from_xlsx
 from pdf_docs import generate_dispatch_challan_pdf, build_invoice
 from pdf_procurement import build_material_requirement
+from pdf_card import build_production_card
 from fastapi.responses import StreamingResponse
 from io import BytesIO
 
@@ -170,10 +171,12 @@ class ComponentUpdate(BaseModel):
 class WorkerIn(BaseModel):
     name: str
     phone: Optional[str] = ""
-    skill: str = "general"  # general / cutting / upper / bottom / stitching / lasting / sole_pasting / finishing
+    skill: str = "general"
     rate_per_pair: float = 0
     active: bool = True
     notes: Optional[str] = ""
+    bonus_pct: float = 0
+    target_cycle_days: float = 0
 
 class AssignmentUpdate(BaseModel):
     role: str  # cutting | upper | bottom | sole | stitching | lasting | sole_pasting | finishing
@@ -192,6 +195,19 @@ class AdvanceIn(BaseModel):
     amount: float
     date: Optional[str] = ""
     notes: Optional[str] = ""
+    txn_type: Literal["advance", "payment", "bonus", "adjustment"] = "advance"
+    # advance = loan upfront, payment = wage paid out, bonus = bonus credit (positive), adjustment = manual correction
+
+class WorkerIn(BaseModel):
+    name: str
+    phone: Optional[str] = ""
+    skill: str = "general"
+    rate_per_pair: float = 0
+    active: bool = True
+    notes: Optional[str] = ""
+    # Productivity bonus config
+    bonus_pct: float = 0  # e.g., 10 = 10% bonus on qualifying jobs
+    target_cycle_days: float = 0  # threshold in days; 0 = bonus disabled
 
 
 
@@ -1292,6 +1308,136 @@ async def create_advance(payload: AdvanceIn, request: Request):
     doc["id"] = str(res.inserted_id)
     return doc
 
+
+@api.get("/workers/{wid}/ledger")
+async def worker_ledger(wid: str, request: Request,
+                        from_date: Optional[str] = None, to_date: Optional[str] = None):
+    """Per-worker chronological ledger of earnings (credit) and payments/advances (debit)
+    with running balance. Earnings are computed live from completed jobs.
+    Bonuses are computed if worker.target_cycle_days > 0 and worker.bonus_pct > 0.
+    """
+    await get_current_user(request)
+    w = await db.workers.find_one({"_id": oid(wid)})
+    if not w:
+        raise HTTPException(404, "Worker not found")
+    worker = stringify(w)
+
+    bonus_pct = float(worker.get("bonus_pct", 0) or 0)
+    target_cycle_days = float(worker.get("target_cycle_days", 0) or 0)
+
+    # Earnings from completed jobs (and bonuses where eligible)
+    job_q = {}
+    if from_date:
+        job_q["updated_at"] = {"$gte": from_date}
+    if to_date:
+        job_q.setdefault("updated_at", {})
+        job_q["updated_at"]["$lte"] = to_date + "T23:59:59Z"
+    jobs = await db.production_jobs.find(job_q).to_list(5000)
+
+    entries = []
+    for j in jobs:
+        assigns = j.get("assignments") or {}
+        comp = j.get("completed_qty", 0)
+        if not comp and j.get("stage") == "dispatched":
+            comp = j.get("quantity", 0)
+        if not comp:
+            continue
+        for role, a in assigns.items():
+            if a.get("worker_id") != wid:
+                continue
+            rate = float(a.get("rate_per_pair") if a.get("rate_per_pair") is not None
+                         else worker.get("rate_per_pair", 0) or 0)
+            earning = round(rate * comp, 2)
+            # Date: use job.updated_at or last history entry
+            entry_date = (j.get("updated_at") or j.get("created_at") or "")[:10]
+            entries.append({
+                "date": entry_date,
+                "txn_type": "earning",
+                "amount": earning,  # positive = credit
+                "description": f"{j.get('po_number','')} · {j.get('style_code','')} · {j.get('color','')} · Sz {j.get('size','')} · {role.upper()} ({comp} prs × ₹{rate}/pr)",
+                "ref": j.get("po_number"),
+            })
+
+            # Bonus: if target_cycle_days set, compare assignment->dispatched duration
+            if bonus_pct > 0 and target_cycle_days > 0:
+                hist = j.get("history") or []
+                assign_at = None
+                done_at = None
+                for h in hist:
+                    if h.get("event") in ("assignment_update", "bulk_assignment") and h.get("role") == role and h.get("worker_id") == wid:
+                        assign_at = h.get("at")
+                    if h.get("stage") == "dispatched":
+                        done_at = h.get("at")
+                if assign_at and done_at:
+                    try:
+                        delta = (datetime.fromisoformat(done_at) - datetime.fromisoformat(assign_at)).total_seconds() / 86400
+                        if 0 <= delta <= target_cycle_days:
+                            bonus = round(earning * bonus_pct / 100, 2)
+                            entries.append({
+                                "date": done_at[:10],
+                                "txn_type": "bonus",
+                                "amount": bonus,
+                                "description": f"Productivity bonus ({bonus_pct}%) for completing in {delta:.1f} days (target {target_cycle_days}d) · {j.get('style_code')} {j.get('color')}",
+                                "ref": j.get("po_number"),
+                            })
+                    except Exception:
+                        pass
+
+    # Advances / payments
+    adv_q = {"worker_id": wid}
+    if from_date:
+        adv_q["date"] = {"$gte": from_date}
+    if to_date:
+        adv_q.setdefault("date", {})
+        adv_q["date"]["$lte"] = to_date
+    advs = await db.advances.find(adv_q).to_list(5000)
+    for a in advs:
+        a_str = stringify(a)
+        amt = float(a_str.get("amount", 0) or 0)
+        ttype = a_str.get("txn_type") or "advance"
+        # advance + payment are DEBITS (reduce worker balance), bonus is CREDIT, adjustment can be either (use sign)
+        if ttype in ("advance", "payment"):
+            signed = -amt
+        elif ttype == "bonus":
+            signed = amt
+        else:  # adjustment - use sign as-is
+            signed = amt
+        entries.append({
+            "id": a_str.get("id"),
+            "date": (a_str.get("date") or a_str.get("created_at", ""))[:10],
+            "txn_type": ttype,
+            "amount": signed,
+            "description": a_str.get("notes") or {
+                "advance": "Advance taken", "payment": "Payment paid out",
+                "bonus": "Manual bonus", "adjustment": "Adjustment"
+            }.get(ttype, ttype),
+            "settled": a_str.get("settled", False),
+        })
+
+    # Sort by date, then earnings before payments on same date
+    entries.sort(key=lambda e: (e["date"] or "", 0 if e["txn_type"] in ("earning", "bonus") else 1))
+
+    # Running balance
+    bal = 0.0
+    for e in entries:
+        bal = round(bal + e["amount"], 2)
+        e["balance"] = bal
+
+    total_earned = round(sum(e["amount"] for e in entries if e["txn_type"] in ("earning", "bonus")), 2)
+    total_paid = round(sum(-e["amount"] for e in entries if e["txn_type"] in ("advance", "payment")), 2)
+    return {
+        "worker": {
+            "id": wid, "name": worker.get("name"), "skill": worker.get("skill"),
+            "phone": worker.get("phone"), "rate_per_pair": worker.get("rate_per_pair"),
+            "bonus_pct": bonus_pct, "target_cycle_days": target_cycle_days,
+        },
+        "entries": entries,
+        "total_earned": total_earned,
+        "total_paid": total_paid,
+        "balance": round(total_earned - total_paid, 2),
+        "from_date": from_date, "to_date": to_date,
+    }
+
 @api.patch("/advances/{aid}")
 async def update_advance(aid: str, payload: dict, request: Request):
     u = await get_current_user(request); require_roles("admin", "manager")(u)
@@ -1347,7 +1493,6 @@ async def report_payroll(request: Request, from_date: Optional[str] = None, to_d
             w = worker_map.get(wid)
             if not w:
                 continue
-            # Use job-specific rate if available, else worker default
             rate = float(a.get("rate_per_pair") if a.get("rate_per_pair") is not None
                          else w.get("rate_per_pair", 0) or 0)
             earn = rate * comp
@@ -1355,18 +1500,46 @@ async def report_payroll(request: Request, from_date: Optional[str] = None, to_d
                 earnings[wid] = {
                     "worker_id": wid, "name": w.get("name", ""), "skill": w.get("skill", ""),
                     "phone": w.get("phone", ""), "default_rate": float(w.get("rate_per_pair", 0) or 0),
+                    "bonus_pct": float(w.get("bonus_pct", 0) or 0),
+                    "target_cycle_days": float(w.get("target_cycle_days", 0) or 0),
                     "total_pairs": 0, "total_earning": 0.0,
+                    "total_bonus": 0.0,
                     "advances_taken": 0.0, "advances_open": 0.0,
+                    "payments_paid": 0.0,
                     "net_payable": 0.0,
                     "by_role": {}, "jobs": [],
                 }
             earnings[wid]["total_pairs"] += comp
             earnings[wid]["total_earning"] += earn
             earnings[wid]["by_role"][role] = earnings[wid]["by_role"].get(role, 0) + comp
+
+            # Productivity bonus
+            bonus_amt = 0
+            bp = float(w.get("bonus_pct", 0) or 0)
+            td = float(w.get("target_cycle_days", 0) or 0)
+            if bp > 0 and td > 0:
+                hist = j.get("history") or []
+                assign_at = None
+                done_at = None
+                for h in hist:
+                    if h.get("event") in ("assignment_update", "bulk_assignment") and h.get("role") == role and h.get("worker_id") == wid:
+                        assign_at = h.get("at")
+                    if h.get("stage") == "dispatched":
+                        done_at = h.get("at")
+                if assign_at and done_at:
+                    try:
+                        delta_days = (datetime.fromisoformat(done_at) - datetime.fromisoformat(assign_at)).total_seconds() / 86400
+                        if 0 <= delta_days <= td:
+                            bonus_amt = round(earn * bp / 100, 2)
+                            earnings[wid]["total_bonus"] += bonus_amt
+                    except Exception:
+                        pass
+
             earnings[wid]["jobs"].append({
                 "po_number": j.get("po_number"), "style_code": j.get("style_code"),
                 "color": j.get("color"), "size": j.get("size"),
-                "role": role, "pairs": comp, "rate": rate, "earning": round(earn, 2),
+                "role": role, "pairs": comp, "rate": rate,
+                "earning": round(earn, 2), "bonus": bonus_amt,
             })
 
     # Aggregate advances per worker (filter by period if dates given)
@@ -1387,13 +1560,23 @@ async def report_payroll(request: Request, from_date: Optional[str] = None, to_d
     for wid, e in earnings.items():
         for a in adv_by_worker.get(wid, []):
             amt = float(a.get("amount", 0) or 0)
-            e["advances_taken"] += amt
-            if not a.get("settled"):
-                e["advances_open"] += amt
-        e["net_payable"] = round(e["total_earning"] - e["advances_open"], 2)
+            ttype = a.get("txn_type") or "advance"
+            if ttype == "advance":
+                e["advances_taken"] += amt
+                if not a.get("settled"):
+                    e["advances_open"] += amt
+            elif ttype == "payment":
+                e["payments_paid"] += amt
+            elif ttype == "bonus":
+                e["total_bonus"] += amt
+            # adjustment is ignored in summary (use ledger to view)
+        gross = e["total_earning"] + e["total_bonus"]
+        e["net_payable"] = round(gross - e["advances_open"] - e["payments_paid"], 2)
         e["total_earning"] = round(e["total_earning"], 2)
+        e["total_bonus"] = round(e["total_bonus"], 2)
         e["advances_taken"] = round(e["advances_taken"], 2)
         e["advances_open"] = round(e["advances_open"], 2)
+        e["payments_paid"] = round(e["payments_paid"], 2)
 
     # Also include workers with no earnings but with advances in period
     for wid, advs in adv_by_worker.items():
@@ -1402,26 +1585,35 @@ async def report_payroll(request: Request, from_date: Optional[str] = None, to_d
         w = worker_map.get(wid)
         if not w:
             continue
-        taken = sum(float(a.get("amount", 0) or 0) for a in advs)
-        open_amt = sum(float(a.get("amount", 0) or 0) for a in advs if not a.get("settled"))
+        taken = sum(float(a.get("amount", 0) or 0) for a in advs if (a.get("txn_type") or "advance") == "advance")
+        open_amt = sum(float(a.get("amount", 0) or 0) for a in advs if (a.get("txn_type") or "advance") == "advance" and not a.get("settled"))
+        paid = sum(float(a.get("amount", 0) or 0) for a in advs if a.get("txn_type") == "payment")
+        bon = sum(float(a.get("amount", 0) or 0) for a in advs if a.get("txn_type") == "bonus")
         earnings[wid] = {
             "worker_id": wid, "name": w.get("name", ""), "skill": w.get("skill", ""),
             "phone": w.get("phone", ""), "default_rate": float(w.get("rate_per_pair", 0) or 0),
-            "total_pairs": 0, "total_earning": 0.0,
+            "bonus_pct": float(w.get("bonus_pct", 0) or 0),
+            "target_cycle_days": float(w.get("target_cycle_days", 0) or 0),
+            "total_pairs": 0, "total_earning": 0.0, "total_bonus": round(bon, 2),
             "advances_taken": round(taken, 2), "advances_open": round(open_amt, 2),
-            "net_payable": round(-open_amt, 2),
+            "payments_paid": round(paid, 2),
+            "net_payable": round(bon - open_amt - paid, 2),
             "by_role": {}, "jobs": [],
         }
 
     rows = list(earnings.values())
     rows.sort(key=lambda r: r["net_payable"], reverse=True)
     grand = round(sum(r["total_earning"] for r in rows), 2)
+    grand_bonus = round(sum(r["total_bonus"] for r in rows), 2)
     grand_advances = round(sum(r["advances_open"] for r in rows), 2)
+    grand_payments = round(sum(r["payments_paid"] for r in rows), 2)
     return {
         "rows": rows,
         "grand_total": grand,
+        "grand_bonus": grand_bonus,
         "grand_advances_open": grand_advances,
-        "grand_net_payable": round(grand - grand_advances, 2),
+        "grand_payments": grand_payments,
+        "grand_net_payable": round(grand + grand_bonus - grand_advances - grand_payments, 2),
         "worker_count": len(rows),
         "from_date": from_date, "to_date": to_date,
     }
@@ -1538,6 +1730,62 @@ async def inventory_alerts(request: Request):
 
 
 
+
+
+@api.post("/production/card.pdf")
+async def production_card_pdf(payload: dict, request: Request):
+    """Generate a printable production card PDF for a (style+color+po) group.
+    Accepts {job_ids:[...]} of all jobs belonging to the same style+color+PO.
+    """
+    await get_current_user(request)
+    job_ids = payload.get("job_ids", [])
+    if not job_ids:
+        raise HTTPException(400, "job_ids required")
+    obj_ids = []
+    for jid in job_ids:
+        try:
+            obj_ids.append(oid(jid))
+        except HTTPException:
+            continue
+    jobs = await db.production_jobs.find({"_id": {"$in": obj_ids}}).to_list(500)
+    if not jobs:
+        raise HTTPException(404, "Jobs not found")
+    j0 = jobs[0]
+    # aggregate
+    sizes = []
+    seen = set()
+    for j in sorted(jobs, key=lambda x: (float(x.get("size", 999)) if str(x.get("size", "")).replace('.', '', 1).isdigit() else 999)):
+        sz = str(j.get("size", "—"))
+        if sz in seen:
+            continue
+        seen.add(sz)
+        sizes.append({"size": sz, "quantity": j.get("quantity", 0)})
+    total_qty = sum(j.get("quantity", 0) for j in jobs)
+    # components: aggregate (all=true)
+    comp = {
+        "upper_done": all((j.get("components") or {}).get("upper_done") for j in jobs),
+        "bottom_done": all((j.get("components") or {}).get("bottom_done") for j in jobs),
+        "sole_done": all((j.get("components") or {}).get("sole_done") for j in jobs),
+    }
+    group = {
+        "po_number": j0.get("po_number", ""),
+        "client_name": j0.get("client_name", ""),
+        "style_code": j0.get("style_code", ""),
+        "color": j0.get("color", ""),
+        "description": j0.get("description", ""),
+        "delivery_date": j0.get("delivery_date", ""),
+        "sizes": sizes,
+        "total_qty": total_qty,
+        "components": comp,
+        "assignments": j0.get("assignments") or {},
+    }
+    style = await db.styles.find_one({"code": j0.get("style_code")})
+    style_d = stringify(style) if style else None
+    pdf_bytes = build_production_card(group, style_d)
+    return StreamingResponse(
+        BytesIO(pdf_bytes), media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="card-{group["po_number"]}-{group["style_code"]}-{group["color"]}.pdf"'},
+    )
 
 
 # ---------- DEFECTS ----------

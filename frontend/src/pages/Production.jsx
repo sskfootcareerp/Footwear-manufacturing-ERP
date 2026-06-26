@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { http } from "../lib/api";
 import { PageHeader, Card, BtnPrimary, BtnSecondary } from "../components/ui-kit";
 import { useAuth } from "../lib/auth";
-import { FileDown, Check, UserPlus, Edit3, ClipboardList, X, HardHat, GripVertical } from "lucide-react";
+import { FileDown, Check, UserPlus, Edit3, ClipboardList, X, HardHat, GripVertical, Printer } from "lucide-react";
 
 const STAGES = [
   { key: "procurement", label: "Procurement", color: "#64748B" },
@@ -87,6 +87,7 @@ function aggregateAssignments(rows) {
 export default function Production() {
   const [jobs, setJobs] = useState([]);
   const [workers, setWorkers] = useState([]);
+  const [styles, setStyles] = useState([]);
   const [selected, setSelected] = useState({});
   const [procSelected, setProcSelected] = useState({});
   const [merging, setMerging] = useState(false);
@@ -100,10 +101,28 @@ export default function Production() {
   const canEdit = ["admin", "manager", "production"].includes(user?.role);
 
   const load = async () => {
-    const [j, w] = await Promise.all([http.get("/production/jobs"), http.get("/workers")]);
-    setJobs(j.data); setWorkers(w.data);
+    const [j, w, s] = await Promise.all([
+      http.get("/production/jobs"),
+      http.get("/workers"),
+      http.get("/styles"),
+    ]);
+    setJobs(j.data); setWorkers(w.data); setStyles(s.data);
   };
   useEffect(() => { load(); }, []);
+
+  const styleByCode = useMemo(() => {
+    const m = {};
+    for (const s of styles) m[s.code] = s;
+    return m;
+  }, [styles]);
+
+  const printCard = async (group) => {
+    try {
+      const res = await http.post("/production/card.pdf",
+        { job_ids: group.rows.map(r => r.id) }, { responseType: "blob" });
+      window.open(URL.createObjectURL(new Blob([res.data], { type: "application/pdf" })), "_blank");
+    } catch (e) { alert("Print failed: " + (e.response?.data?.detail || e.message)); }
+  };
 
   const moveGroup = async (group, nextStage) => {
     await Promise.all(group.rows.map(j => http.patch(`/production/jobs/${j.id}`, { stage: nextStage })));
@@ -281,6 +300,7 @@ export default function Production() {
                       <ColorGroupCard
                         key={g.key}
                         group={g}
+                        style={styleByCode[g.style_code]}
                         workers={workers}
                         stageColor={s.color}
                         stageIdx={STAGES.findIndex(x => x.key === s.key)}
@@ -289,6 +309,7 @@ export default function Production() {
                         onToggleComponent={toggleComponent}
                         onOpenAssign={(role) => setAssignFor({ group: g, role })}
                         onOpenQty={(rowId) => setQtyFor({ group: g, rowId })}
+                        onPrint={() => printCard(g)}
                         isProc={isProc}
                         isDispatched={isDisp}
                         onMatReq={() => downloadMaterialRequirement([g], `${g.style_code} · ${g.color}`)}
@@ -393,8 +414,8 @@ export default function Production() {
 }
 
 function ColorGroupCard(props) {
-  const { group, stageColor, stageIdx, canEdit, onMove, onToggleComponent,
-    onOpenAssign, onOpenQty, isProc, isDispatched, onMatReq,
+  const { group, style, stageColor, stageIdx, canEdit, onMove, onToggleComponent,
+    onOpenAssign, onOpenQty, onPrint, isProc, isDispatched, onMatReq,
     procSelected, onToggleProcSelect, isSelected, onToggleSelect, onDownloadInvoice } = props;
   const nextStage = STAGES[stageIdx + 1];
   const prevStage = STAGES[stageIdx - 1];
@@ -414,6 +435,11 @@ function ColorGroupCard(props) {
 
   return (
     <Card className="border-l-4 hover:border-[#C27842] transition-colors" style={{ borderLeftColor: stageColor }} data-testid={`group-${group.key}`}>
+      {style?.image_url && (
+        <div className="h-28 bg-slate-100 border-b border-slate-200 overflow-hidden">
+          <img src={style.image_url} alt={style.name} className="w-full h-full object-cover" data-testid={`card-img-${group.key}`} />
+        </div>
+      )}
       <div className="p-3 pb-2 border-b border-slate-100">
         <div className="flex items-baseline justify-between mb-0.5">
           <div className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">{group.po_number}</div>
@@ -524,6 +550,12 @@ function ColorGroupCard(props) {
       <div className="px-3 pb-3 flex items-center justify-between gap-2 flex-wrap">
         {group.delivery_date && <div className="text-[10px] text-slate-500">Deliver: {group.delivery_date}</div>}
         <div className="flex gap-2 ml-auto items-center flex-wrap">
+          {canEdit && (
+            <button onClick={onPrint} title="Print production card" data-testid={`print-${group.key}`}
+              className="text-[10px] uppercase tracking-wider font-bold text-slate-700 hover:text-white hover:bg-[#0F172A] border border-slate-300 px-2 py-1 flex items-center gap-1">
+              <Printer className="w-3 h-3" /> Print
+            </button>
+          )}
           {isProc && (
             <button onClick={onMatReq} className="text-[10px] uppercase tracking-wider font-bold text-white bg-[#2563EB] hover:bg-[#1E40AF] px-3 py-1 flex items-center gap-1" data-testid={`mat-req-${group.key}`}>
               <ClipboardList className="w-3 h-3" /> Material Req.
