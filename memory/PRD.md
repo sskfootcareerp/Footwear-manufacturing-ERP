@@ -1,48 +1,45 @@
-# SSK Footcare Manufacturing ERP – PRD
+# SSK Footcare ERP — PRD
 
-## Original problem statement
-> Build a footwear manufacturing management system that replicates the user's Excel master costing sheet, ingests their client POs (PDF/Excel), and tracks the manufacturing process end-to-end. Multi-user, multi-role, cloud-based. Tax per PO. Built to match the user's "B2B Shoe Production Management System" 8-stage workflow.
+## Original Problem Statement
+Build a comprehensive local/cloud B2B footwear manufacturing ERP. Costing calculation based on raw-material yield, order management against styles, production floor tracking (9 stages) with kanban-style colour×size matrix, PO upload/extraction from PDF/Excel, multi-user/multi-role login, inventory, worker payroll ledger and productivity bonuses.
 
-## User personas
-1. **Admin (factory owner)** — manages users, masters, sees everything
-2. **Manager** — operations, BOM, costing, POs, production
-3. **Production staff** — moves jobs across stages, logs defects
-4. **Sales** — creates/views POs, dashboard
+## User Personas
+- Admin / Owner — full system control, settings, users, costing margins
+- Manager — POs, production scheduling, payroll, reports
+- Production lead — daily floor (kanban, assignments, defects, WhatsApp share)
+- Sales — POs, styles, dispatch invoices
 
-## Core requirements (locked)
-- Cloud-based, browser-accessible, multi-user with role-based access
-- INR currency, GST per PO (CGST/SGST/IGST)
-- Replicate master Excel costing sheet (materials + labor + overhead + margin)
-- AI ingestion of PO PDF/Excel (Gemini via Emergent LLM key)
-- 8-stage production tracking: procurement → cutting → folding → attachment → stitching → lasting → sole_pasting → finishing → dispatched
-- Defect & rework tracker
+## Core Requirements (static)
+1. Style master with BOM + yield-based costing + image
+2. PO upload from PDF/Excel with auto job creation
+3. Production floor with 9 stages, colour×size matrix
+4. Inventory with auto-consumption on procurement→cutting
+5. Worker (Karigar) master + assignment + ledger + bonus
+6. Payroll with advances + payments + ledger reconciliation
+7. PDFs: Production Card (with per-process tally), Dispatch Challan, Tax Invoice, Material Requirements, Wage Slip
+8. Multi-user RBAC (admin/manager/production/sales)
+9. Visual reports (variance, cycle time, defect, monthly, karigar)
+10. Time-bound stages with overdue alerts (admin-configurable)
+11. WhatsApp share for production cards
 
-## Implemented (Feb 2026)
-- **Auth**: JWT + bcrypt, httpOnly cookies, login/logout/me, 4 roles, admin seed on startup
-- **Users**: full CRUD with RBAC (admin-only)
-- **Materials Rate Card**: full CRUD, categories (upper/sole/lining/accessory/consumable/packing/other)
-- **Style Master**: BOM (multi-section), labor operations, overhead %, packing, margin %, GST %, live cost preview
-- **Costing Calculator**: pick style, see full breakdown, override margin/GST to scenario-test
-- **Purchase Orders**: manual entry + AI extraction from PDF/Excel (Gemini 2.5 Flash), full tax breakdown, auto-creates production jobs
-- **Production Kanban**: 9 columns matching ops sheet, forward/backward stage moves with history audit
-- **Defects & QC**: log defects per stage with type/qty/cost/root-cause/corrective action/rework status
-- **Dashboard**: KPIs (active POs, WIP pairs, dispatched, revenue), production funnel chart, recent POs
+## What's been implemented
+- 2026-06-25 (forks 1-9): Full ERP base, Auth, PO PDF parsing, Production kanban (color×size), BOM/Yield costing, Style image upload, Components tracking, Karigar assignment + DnD bulk re-assign, Karigar ledger + bonus + wage-slip PDF, Inventory auto-consume + reorder alerts, Dispatch Challan + Tax Invoice + Material Req PDFs.
+- 2026-06-26 (this fork — iteration 10):
+  • **P0 fix**: Payment recording 400 error in Payroll (`openLedger(ledgerFor.row)`)
+  • **Settings/ETA**: `/api/settings/stage-durations` + `/settings` page — admin configures per-stage hours
+  • **Time-bound stages**: `stage_entered_at` + `stage_deadline` saved on every transition + initial job creation
+  • **Overdue alerts**: `/api/dashboard/overdue` + red banner on Dashboard + red `OVERDUE` strip on Production cards
+  • **Visual Reports** (Recharts): Production Trend (line), Karigar Output (bar), Cost Variance (bar), Cycle Time (bar), Defect Analytics (bar + pie)
+  • **Production Card PDF**: added `PROCESS TALLY` table — per-process × per-size grid (DONE/REJ/SIGN columns) for floor workers to fill in
+  • **WhatsApp Share**: green WhatsApp button on every production card, dialog with karigar phone picker, downloads PDF locally + opens wa.me chat
 
-## Tested (iteration 1)
-- Backend: 92% (Users 500 bug fixed in retest pass)
-- Frontend: 100% — all 8 sidebar pages load, Kanban shows 9 stages, AI extraction successfully parsed Siyaram PO (₹4,91,400, 20 line items)
+## Prioritized Backlog
+**P0** — none open
+**P1** — Bulk pay multiple karigars at end-of-week (deferred per user)
+**P2** — Server-side WhatsApp Cloud API for direct PDF upload (no manual drag-drop)
+**P2** — Visual seed for testing overdue badge (job with past stage_deadline)
+**P3** — Split `server.py` into modules (production / payroll / reports)
 
-## Backlog (P1 / P2)
-- **P1** – Inventory module (track raw-material stock vs consumption against production jobs)
-- **P1** – Per-line-item job assignment to specific operators on the Kanban
-- **P1** – PDF invoice/dispatch challan generation for completed POs
-- **P2** – Reports: cost variance, stage cycle time, defect rate by stage
-- **P2** – Email/SMS notifications on stage completion
-- **P2** – Size-wise stock & WIP matrix
-- **P2** – Client master (separate from PO free-text) with history
-
-## Tech stack
-- Backend: FastAPI + Motor (MongoDB async), JWT auth, Pydantic v2
-- AI: emergentintegrations + Gemini 2.5 Flash for PO extraction
-- Frontend: React + React Router + Tailwind, Chivo/IBM Plex Sans/JetBrains Mono fonts
-- Shadcn UI + lucide-react icons
+## Next Tasks
+- (When user asks) Bulk pay multi-karigar payout flow
+- (When user asks) WhatsApp Cloud API integration
