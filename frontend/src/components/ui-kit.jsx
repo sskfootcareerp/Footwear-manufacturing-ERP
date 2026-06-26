@@ -32,9 +32,9 @@ export function BtnSecondary({ children, className = "", ...rest }) {
   );
 }
 
-export function Card({ children, className = "" }) {
+export function Card({ children, className = "", style, ...rest }) {
   return (
-    <div className={`bg-white border-2 border-slate-200 ${className}`}>{children}</div>
+    <div className={`bg-white border-2 border-slate-200 ${className}`} style={style} {...rest}>{children}</div>
   );
 }
 

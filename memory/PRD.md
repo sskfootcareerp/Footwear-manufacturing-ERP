@@ -56,3 +56,15 @@ Build a comprehensive local/cloud B2B footwear manufacturing ERP. Costing calcul
 
 ### Verified
 - iteration_11.json: Backend 7/7, Frontend 4/4 critical flows green. Auto-archive end-to-end (PATCH dispatched → POST invoice → POST packing → archived=True). PDF page size exactly 595x842 pt with 'SSK FOOTCARE MANUFACTURING LLP' string present.
+
+## Iteration 12 (2026-06-26)
+- **PDF Extractor fix for SHEIN/NEXTGEN format**: multi-line table cells, comma-split description → desc/color/size, smarter client/vendor detection (top-of-document and Vendor-Code pattern), Total Order Value / TOTALBASICVALUE detection, prefer BaseCost over MRP for unit_price. Verified: 126 line items from 25-page PDF.
+- **Packing-list manual fields**: dispatch_date, transporter, vehicle_no, driver_name, driver_phone, site_code, destination, port, notes all captured via a modal and rendered into the xlsx (row 15 + notes block at bottom).
+- **Persistence & re-download**: every generated packing list saved (file_b64 in `packing_lists`). `GET /api/packing-lists` lists them, `GET /api/packing-lists/{id}/file` re-downloads the exact original bytes. Archive view shows a "Saved Packing Lists" table.
+- **Merged packing list**: `POST /api/packing-lists/merged` produces ONE xlsx for jobs spanning multiple POs of the same client. Optional `sectioned=true` inserts a "PO: <number>" header row per source PO. Cross-client merges 400.
+- **Auto-pick template by alias**: `PackingTemplate.aliases: List[str]`. When generating without explicit `template_id`, the system picks the template whose alias is a case-insensitive substring of the PO's client_name. Settings page exposes upload/list/delete UI.
+- **UI Polish**: `Card` component now forwards arbitrary props (data-testid, style, etc.) — fixes the LOW-priority pass-through issues flagged in test report.
+
+### Verified (iteration_12.json)
+- Backend: 10/10
+- Frontend: all 4 critical flows green (Packing modal with 14 fields, Merge-Packing button, Archive view re-download, Templates upload+delete)
