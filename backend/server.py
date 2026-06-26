@@ -4,6 +4,7 @@ from pathlib import Path
 load_dotenv(Path(__file__).parent / ".env")
 
 import os
+import re
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal, Dict
@@ -280,6 +281,42 @@ class PackingTemplateIn(BaseModel):
     name: str   # human-friendly label
     aliases: Optional[List[str]] = None  # client-name keywords this template auto-matches
     file_b64: str  # base64-encoded xlsx file contents
+
+
+# ----- Accounts Receivable / Ledger models -----
+DEFAULT_CREDIT_DAYS = 45
+PAYMENT_MODES = ["Bank Transfer", "RTGS", "NEFT", "Cheque", "UPI", "Cash", "Adjustment"]
+
+
+class GRNLineItem(BaseModel):
+    style_code: str = ""
+    description: str = ""
+    color: str = ""
+    size: str = ""
+    dispatched_qty: int = 0
+    received_qty: int = 0
+    accepted_qty: int = 0
+    rejected_qty: int = 0
+    rejection_reason: str = ""
+
+
+class GRNIn(BaseModel):
+    invoice_id: str
+    grn_date: str  # YYYY-MM-DD
+    received_date: Optional[str] = ""
+    client_reference: Optional[str] = ""  # client's GRN ref / email subject
+    notes: Optional[str] = ""
+    line_items: List[GRNLineItem]
+
+
+class PaymentIn(BaseModel):
+    invoice_ids: List[str]  # can pay multiple invoices in one go
+    amount: float
+    payment_date: str  # YYYY-MM-DD
+    mode: Literal["Bank Transfer", "RTGS", "NEFT", "Cheque", "UPI", "Cash", "Adjustment"]
+    reference: Optional[str] = ""  # UTR / Cheque no / Txn id
+    bank: Optional[str] = ""
+    notes: Optional[str] = ""
 
 class DefectIn(BaseModel):
     po_number: str
@@ -663,6 +700,157 @@ async def next_invoice_no() -> str:
     return f"SSK{fy_label}-{seq:03d}"
 
 
+# ---------- ACCOUNTS-RECEIVABLE HELPERS ----------
+def _extract_credit_days(payment_terms_text: str | None) -> int:
+    """Pull credit days from a free-text payment-terms field (e.g., 'Net 30',
+    '45 days', 'within 60 days from invoice'). Falls back to DEFAULT_CREDIT_DAYS."""
+    if not payment_terms_text:
+        return DEFAULT_CREDIT_DAYS
+    m = re.search(r"(\d{1,3})\s*(?:days|d)?\b", str(payment_terms_text), flags=re.I)
+    if m:
+        n = int(m.group(1))
+        if 0 < n < 365:
+            return n
+    return DEFAULT_CREDIT_DAYS
+
+
+def _due_iso(invoice_date_str: str, credit_days: int) -> str:
+    """Convert an `invoice_date` (DD/MM/YYYY) + credit_days into YYYY-MM-DD."""
+    try:
+        if "/" in invoice_date_str:
+            base = datetime.strptime(invoice_date_str, "%d/%m/%Y")
+        else:
+            base = datetime.strptime(invoice_date_str[:10], "%Y-%m-%d")
+    except Exception:
+        base = datetime.now()
+    return (base + timedelta(days=int(credit_days))).date().isoformat()
+
+
+def _compute_invoice_totals(po: dict, line_items: list[dict]) -> dict:
+    """Subtotal + CGST/SGST/IGST + grand_total from line items, using PO rates."""
+    subtotal = sum(float(li.get("amount") or 0) for li in line_items)
+    qty = sum(int(li.get("quantity") or 0) for li in line_items)
+    cgst_rate = float(po.get("cgst_rate") or 0)
+    sgst_rate = float(po.get("sgst_rate") or 0)
+    igst_rate = float(po.get("igst_rate") or 0)
+    cgst_amt = round(subtotal * cgst_rate / 100, 2)
+    sgst_amt = round(subtotal * sgst_rate / 100, 2)
+    igst_amt = round(subtotal * igst_rate / 100, 2)
+    grand = round(subtotal + cgst_amt + sgst_amt + igst_amt, 2)
+    return {
+        "subtotal": round(subtotal, 2),
+        "total_quantity": qty,
+        "cgst_amount": cgst_amt, "sgst_amount": sgst_amt, "igst_amount": igst_amt,
+        "cgst_rate": cgst_rate, "sgst_rate": sgst_rate, "igst_rate": igst_rate,
+        "grand_total": grand,
+    }
+
+
+def _invoice_iso_date(d: str) -> str:
+    """Normalise an invoice_date (DD/MM/YYYY) to YYYY-MM-DD for consistent sorting."""
+    try:
+        if "/" in d:
+            return datetime.strptime(d, "%d/%m/%Y").date().isoformat()
+        return datetime.strptime(d[:10], "%Y-%m-%d").date().isoformat()
+    except Exception:
+        return datetime.now().date().isoformat()
+
+
+def _decorate_invoice(doc: dict, payments_map: dict | None = None, grns_map: dict | None = None) -> dict:
+    """Compute live status + outstanding from saved invoice doc + payments/grns aggregates."""
+    inv = stringify(doc)
+    iid = inv.get("id")
+    paid = float((payments_map or {}).get(iid, 0))
+    grn_adj = float((grns_map or {}).get(iid, 0))  # value of short / rejected
+    grand = float(inv.get("grand_total") or 0)
+    net_after_grn = max(0.0, round(grand - grn_adj, 2))
+    outstanding = max(0.0, round(net_after_grn - paid, 2))
+    inv["received_amount"] = round(paid, 2)
+    inv["grn_adjustment"] = round(grn_adj, 2)
+    inv["net_amount"] = net_after_grn
+    inv["outstanding"] = outstanding
+    today_iso = datetime.now().date().isoformat()
+    due = inv.get("due_date") or ""
+    if outstanding <= 0.01:
+        inv["status"] = "paid"
+    elif paid > 0.01:
+        inv["status"] = "partial"
+    elif due and due < today_iso:
+        inv["status"] = "overdue"
+    else:
+        inv["status"] = "pending"
+    if due:
+        try:
+            days = (datetime.fromisoformat(due) - datetime.now()).days
+            inv["days_to_due"] = days
+        except Exception:
+            inv["days_to_due"] = None
+    return inv
+
+
+async def _aggregate_payments_for_invoices(invoice_ids: list[str]) -> dict[str, float]:
+    """Returns invoice_id -> total received (across all payments)."""
+    if not invoice_ids:
+        return {}
+    payments = await db.payments.find({"invoice_ids": {"$in": invoice_ids}}).to_list(5000)
+    out: dict[str, float] = {iid: 0.0 for iid in invoice_ids}
+    for p in payments:
+        # If a payment was allocated across multiple invoices we treat it pro-rata
+        allocs = p.get("allocations") or {}
+        if allocs:
+            for iid, amt in allocs.items():
+                if iid in out:
+                    out[iid] += float(amt or 0)
+        else:
+            amt = float(p.get("amount") or 0)
+            ids = [i for i in (p.get("invoice_ids") or []) if i in out]
+            if ids:
+                share = amt / len(ids)
+                for iid in ids:
+                    out[iid] += share
+    return out
+
+
+async def _aggregate_grn_adjustments(invoice_ids: list[str]) -> dict[str, float]:
+    """Returns invoice_id -> rupee value of short/rejected qty across all GRNs."""
+    if not invoice_ids:
+        return {}
+    grns = await db.grns.find({"invoice_id": {"$in": invoice_ids}}).to_list(5000)
+    out: dict[str, float] = {iid: 0.0 for iid in invoice_ids}
+    # Fetch parent invoices to get unit prices for adjustment
+    invoices = await db.invoices.find({"_id": {"$in": [oid(i) for i in invoice_ids]}}).to_list(5000)
+    inv_by_id = {str(d["_id"]): d for d in invoices}
+    for g in grns:
+        inv = inv_by_id.get(g.get("invoice_id"))
+        if not inv:
+            continue
+        # Build a price map: (style, color, size) -> unit_price
+        prices = {(li.get("style_code"), li.get("color"), str(li.get("size") or "")):
+                  float(li.get("unit_price") or 0) for li in (inv.get("line_items_snapshot") or [])}
+        for ln in g.get("line_items", []):
+            short = max(0, int(ln.get("dispatched_qty", 0)) - int(ln.get("accepted_qty", 0)))
+            key = (ln.get("style_code"), ln.get("color"), str(ln.get("size") or ""))
+            unit = prices.get(key) or 0
+            out[g["invoice_id"]] += short * unit
+    return out
+
+
+async def next_grn_no() -> str:
+    seq = await db.counters.find_one_and_update(
+        {"_id": "grn_seq"}, {"$inc": {"v": 1}}, upsert=True, return_document=True,
+    )
+    n = (seq or {}).get("v", 1)
+    return f"GRN-{datetime.now().year}-{n:04d}"
+
+
+async def next_payment_no() -> str:
+    seq = await db.counters.find_one_and_update(
+        {"_id": "payment_seq"}, {"$inc": {"v": 1}}, upsert=True, return_document=True,
+    )
+    n = (seq or {}).get("v", 1)
+    return f"RCT-{datetime.now().year}-{n:04d}"
+
+
 async def _generate_invoice_payload(po: dict, job_ids: list[str] | None) -> tuple[dict, list[dict]]:
     """Returns the (po-augmented, line_items) for invoice generation.
 
@@ -750,22 +938,38 @@ async def invoice_for_jobs(payload: InvoiceGenerate, request: Request):
         supply_date=payload.supply_date or "",
         line_items=line_items,
     )
-    # Store invoice record
-    await db.invoices.insert_one({
+    # Compute totals + due date for AR tracking
+    totals = _compute_invoice_totals(po, line_items)
+    credit_days = _extract_credit_days(po.get("payment_terms", ""))
+    invoice_iso = _invoice_iso_date(invoice_date)
+    due_date = _due_iso(invoice_date, credit_days)
+    import base64 as _b64
+    # Store invoice record (includes file bytes for re-download)
+    inv_doc = {
         "invoice_no": invoice_no, "invoice_date": invoice_date,
+        "invoice_iso_date": invoice_iso,
+        "due_date": due_date, "payment_terms_days": credit_days,
         "po_id": payload.po_id, "po_number": po.get("po_number"),
+        "po_numbers": [po.get("po_number")],
         "client_name": po.get("client_name"),
         "job_ids": payload.job_ids or [],
         "line_items_snapshot": line_items,
+        **totals,
         "transport_mode": payload.transport_mode, "vehicle_no": payload.vehicle_no,
         "supply_date": payload.supply_date,
         "by": u["email"], "created_at": now_iso(),
-    })
+        "file_b64": _b64.b64encode(pdf_bytes).decode("ascii"),
+        "merged": False,
+    }
+    res = await db.invoices.insert_one(inv_doc)
     # Flag jobs as invoiced; auto-archive if packing list already generated.
     await _flag_jobs(payload.job_ids or [], "invoice_generated_at")
     return StreamingResponse(
         BytesIO(pdf_bytes), media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{invoice_no}.pdf"'},
+        headers={
+            "Content-Disposition": f'inline; filename="{invoice_no}.pdf"',
+            "X-Invoice-Id": str(res.inserted_id),
+        },
     )
 
 
@@ -813,17 +1017,30 @@ async def merged_invoice(payload: dict, request: Request):
         supply_date=payload.get("supply_date", ""),
         line_items=all_items,
     )
-    await db.invoices.insert_one({
+    import base64 as _b64m
+    credit_days_m = _extract_credit_days(parent.get("payment_terms", ""))
+    inv_doc_m = {
         "invoice_no": invoice_no, "invoice_date": invoice_date,
+        "invoice_iso_date": _invoice_iso_date(invoice_date),
+        "due_date": _due_iso(invoice_date, credit_days_m),
+        "payment_terms_days": credit_days_m,
         "merged": True, "po_numbers": po_numbers, "job_ids": job_ids_all,
+        "po_id": str(first_po.get("_id")),
+        "po_number": " + ".join(po_numbers),
         "client_name": parent.get("client_name"),
         "line_items_snapshot": all_items,
+        **_compute_invoice_totals(parent, all_items),
         "by": u["email"], "created_at": now_iso(),
-    })
+        "file_b64": _b64m.b64encode(pdf_bytes).decode("ascii"),
+    }
+    res_m = await db.invoices.insert_one(inv_doc_m)
     await _flag_jobs(job_ids_all, "invoice_generated_at")
     return StreamingResponse(
         BytesIO(pdf_bytes), media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{invoice_no}.pdf"'},
+        headers={
+            "Content-Disposition": f'inline; filename="{invoice_no}.pdf"',
+            "X-Invoice-Id": str(res_m.inserted_id),
+        },
     )
 
 
@@ -841,6 +1058,374 @@ async def po_challan(pid: str, request: Request, dispatch_qty: Optional[int] = N
         BytesIO(pdf_bytes), media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="challan-{po.get("po_number","po")}.pdf"'},
     )
+
+
+# ---------- INVOICE ARCHIVE & ACCOUNTS RECEIVABLE ----------
+@api.get("/invoices")
+async def list_invoices(request: Request, client: Optional[str] = None,
+                        status: Optional[str] = None, limit: int = 500):
+    """Return all generated invoices, decorated with live status + outstanding."""
+    await get_current_user(request)
+    q: dict = {}
+    if client:
+        q["client_name"] = {"$regex": re.escape(client), "$options": "i"}
+    docs = await db.invoices.find(q, {"file_b64": 0}).sort("created_at", -1).to_list(limit)
+    inv_ids = [str(d["_id"]) for d in docs]
+    pay_map = await _aggregate_payments_for_invoices(inv_ids)
+    grn_map = await _aggregate_grn_adjustments(inv_ids)
+    rows = [_decorate_invoice(d, pay_map, grn_map) for d in docs]
+    if status:
+        rows = [r for r in rows if r.get("status") == status]
+    return rows
+
+
+@api.get("/invoices/overdue")
+async def overdue_invoices(request: Request):
+    await get_current_user(request)
+    docs = await db.invoices.find({}, {"file_b64": 0}).sort("due_date", 1).to_list(500)
+    inv_ids = [str(d["_id"]) for d in docs]
+    pay_map = await _aggregate_payments_for_invoices(inv_ids)
+    grn_map = await _aggregate_grn_adjustments(inv_ids)
+    rows = [_decorate_invoice(d, pay_map, grn_map) for d in docs]
+    return [r for r in rows if r["status"] == "overdue"]
+
+
+@api.get("/invoices/{iid}")
+async def get_invoice(iid: str, request: Request):
+    await get_current_user(request)
+    doc = await db.invoices.find_one({"_id": oid(iid)})
+    if not doc:
+        raise HTTPException(404, "Invoice not found")
+    pay_map = await _aggregate_payments_for_invoices([iid])
+    grn_map = await _aggregate_grn_adjustments([iid])
+    inv = _decorate_invoice(doc, pay_map, grn_map)
+    inv.pop("file_b64", None)
+    # Attach related payments + GRNs
+    payments = await db.payments.find({"invoice_ids": iid}).sort("payment_date", -1).to_list(200)
+    grns = await db.grns.find({"invoice_id": iid}).sort("grn_date", -1).to_list(200)
+    inv["payments"] = [stringify(p) for p in payments]
+    inv["grns"] = [stringify(g) for g in grns]
+    return inv
+
+
+@api.get("/invoices/{iid}/file")
+async def download_invoice_file(iid: str, request: Request):
+    await get_current_user(request)
+    doc = await db.invoices.find_one({"_id": oid(iid)})
+    if not doc:
+        raise HTTPException(404, "Invoice not found")
+    import base64 as _b
+    raw = _b.b64decode(doc.get("file_b64", "") or b"")
+    if not raw:
+        raise HTTPException(404, "No PDF stored for this invoice (predates persistence). Regenerate from the PO.")
+    fname = f"{doc.get('invoice_no', 'invoice')}.pdf"
+    return StreamingResponse(
+        BytesIO(raw), media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{fname}"'},
+    )
+
+
+# ---------- GOODS RECEIPT NOTES (GRN) ----------
+@api.post("/grns")
+async def create_grn(payload: GRNIn, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager", "sales")(u)
+    inv = await db.invoices.find_one({"_id": oid(payload.invoice_id)})
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    grn_no = await next_grn_no()
+    lines = []
+    total_disp = total_recv = total_acc = total_rej = 0
+    for li in payload.line_items:
+        disp = int(li.dispatched_qty or 0)
+        recv = int(li.received_qty if li.received_qty is not None else disp)
+        rej = int(li.rejected_qty or 0)
+        acc = int(li.accepted_qty if li.accepted_qty is not None else (recv - rej))
+        lines.append({
+            "style_code": li.style_code, "description": li.description,
+            "color": li.color, "size": li.size,
+            "dispatched_qty": disp, "received_qty": recv,
+            "accepted_qty": acc, "rejected_qty": rej,
+            "rejection_reason": li.rejection_reason,
+        })
+        total_disp += disp; total_recv += recv; total_acc += acc; total_rej += rej
+    doc = {
+        "grn_no": grn_no, "grn_date": payload.grn_date,
+        "received_date": payload.received_date or payload.grn_date,
+        "invoice_id": payload.invoice_id, "invoice_no": inv.get("invoice_no"),
+        "po_id": inv.get("po_id"), "po_number": inv.get("po_number"),
+        "client_name": inv.get("client_name"),
+        "client_reference": payload.client_reference,
+        "notes": payload.notes,
+        "line_items": lines,
+        "total_dispatched": total_disp, "total_received": total_recv,
+        "total_accepted": total_acc, "total_rejected": total_rej,
+        "by": u["email"], "created_at": now_iso(),
+    }
+    res = await db.grns.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    return stringify(doc)
+
+
+@api.get("/grns")
+async def list_grns(request: Request, invoice_id: Optional[str] = None,
+                    client: Optional[str] = None, limit: int = 300):
+    await get_current_user(request)
+    q: dict = {}
+    if invoice_id:
+        q["invoice_id"] = invoice_id
+    if client:
+        q["client_name"] = {"$regex": re.escape(client), "$options": "i"}
+    docs = await db.grns.find(q).sort("grn_date", -1).to_list(limit)
+    return [stringify(d) for d in docs]
+
+
+@api.get("/grns/{gid}")
+async def get_grn(gid: str, request: Request):
+    await get_current_user(request)
+    doc = await db.grns.find_one({"_id": oid(gid)})
+    if not doc:
+        raise HTTPException(404, "GRN not found")
+    return stringify(doc)
+
+
+@api.delete("/grns/{gid}")
+async def delete_grn(gid: str, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    r = await db.grns.delete_one({"_id": oid(gid)})
+    if not r.deleted_count:
+        raise HTTPException(404, "GRN not found")
+    return {"ok": True}
+
+
+# ---------- PAYMENTS ----------
+@api.post("/payments")
+async def create_payment(payload: PaymentIn, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager", "sales")(u)
+    if payload.amount <= 0:
+        raise HTTPException(400, "Amount must be positive")
+    if not payload.invoice_ids:
+        raise HTTPException(400, "At least one invoice required")
+    invoices = await db.invoices.find({"_id": {"$in": [oid(i) for i in payload.invoice_ids]}}).to_list(50)
+    if not invoices:
+        raise HTTPException(404, "No invoices found")
+    # FIFO allocation by due_date (oldest first)
+    invoices.sort(key=lambda d: (d.get("due_date") or "", d.get("invoice_date") or ""))
+    inv_ids_str = [str(d["_id"]) for d in invoices]
+    existing_paid = await _aggregate_payments_for_invoices(inv_ids_str)
+    existing_grn = await _aggregate_grn_adjustments(inv_ids_str)
+    remaining = float(payload.amount)
+    allocations: dict[str, float] = {}
+    for d in invoices:
+        iid = str(d["_id"])
+        net = max(0.0, float(d.get("grand_total") or 0) - existing_grn.get(iid, 0))
+        outstanding = max(0.0, net - existing_paid.get(iid, 0))
+        if outstanding <= 0:
+            continue
+        take = round(min(outstanding, remaining), 2)
+        if take > 0:
+            allocations[iid] = take
+            remaining = round(remaining - take, 2)
+        if remaining <= 0:
+            break
+    if not allocations:
+        raise HTTPException(400, "Selected invoices are already fully paid")
+    payment_no = await next_payment_no()
+    doc = {
+        "payment_no": payment_no,
+        "payment_date": payload.payment_date,
+        "amount": round(float(payload.amount), 2),
+        "advance_amount": round(remaining, 2) if remaining > 0 else 0,  # over-paid surplus
+        "mode": payload.mode, "reference": payload.reference, "bank": payload.bank,
+        "notes": payload.notes,
+        "invoice_ids": list(allocations.keys()),
+        "allocations": allocations,
+        "client_name": invoices[0].get("client_name"),
+        "by": u["email"], "created_at": now_iso(),
+    }
+    res = await db.payments.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    return stringify(doc)
+
+
+@api.get("/payments")
+async def list_payments(request: Request, invoice_id: Optional[str] = None,
+                        client: Optional[str] = None, limit: int = 500):
+    await get_current_user(request)
+    q: dict = {}
+    if invoice_id:
+        q["invoice_ids"] = invoice_id
+    if client:
+        q["client_name"] = {"$regex": re.escape(client), "$options": "i"}
+    docs = await db.payments.find(q).sort("payment_date", -1).to_list(limit)
+    return [stringify(d) for d in docs]
+
+
+@api.delete("/payments/{pid}")
+async def delete_payment(pid: str, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    r = await db.payments.delete_one({"_id": oid(pid)})
+    if not r.deleted_count:
+        raise HTTPException(404, "Payment not found")
+    return {"ok": True}
+
+
+# ---------- CLIENTS / TALLY-STYLE LEDGER ----------
+@api.get("/clients")
+async def list_clients(request: Request):
+    """Return unique clients seen on invoices + their aggregate AR snapshot."""
+    await get_current_user(request)
+    docs = await db.invoices.find({}, {"file_b64": 0}).to_list(5000)
+    if not docs:
+        return []
+    inv_ids = [str(d["_id"]) for d in docs]
+    pay_map = await _aggregate_payments_for_invoices(inv_ids)
+    grn_map = await _aggregate_grn_adjustments(inv_ids)
+    decorated = [_decorate_invoice(d, pay_map, grn_map) for d in docs]
+    summary: dict[str, dict] = {}
+    for r in decorated:
+        client = r.get("client_name") or "—"
+        slot = summary.setdefault(client, {
+            "client_name": client, "invoice_count": 0,
+            "total_invoiced": 0.0, "total_received": 0.0,
+            "outstanding": 0.0, "overdue_count": 0, "overdue_amount": 0.0,
+        })
+        slot["invoice_count"] += 1
+        slot["total_invoiced"] += float(r.get("net_amount") or 0)
+        slot["total_received"] += float(r.get("received_amount") or 0)
+        slot["outstanding"] += float(r.get("outstanding") or 0)
+        if r.get("status") == "overdue":
+            slot["overdue_count"] += 1
+            slot["overdue_amount"] += float(r.get("outstanding") or 0)
+    out = list(summary.values())
+    for s in out:
+        for k in ("total_invoiced", "total_received", "outstanding", "overdue_amount"):
+            s[k] = round(s[k], 2)
+    out.sort(key=lambda s: -s["outstanding"])
+    return out
+
+
+@api.get("/clients/{client_name}/ledger")
+async def client_ledger(client_name: str, request: Request):
+    """Tally-style ledger for a single client.
+
+    Entries (chronological):
+      - Invoice  -> debit  (increases receivable)
+      - GRN short/rejected -> credit (reduces receivable)
+      - Payment  -> credit (reduces receivable)
+    Returns ledger lines + a running balance.
+    """
+    await get_current_user(request)
+    invs = await db.invoices.find({"client_name": client_name}, {"file_b64": 0}).to_list(2000)
+    grns = await db.grns.find({"client_name": client_name}).to_list(2000)
+    pays = await db.payments.find({"client_name": client_name}).to_list(2000)
+
+    # Build price index per invoice for GRN value adjustments
+    price_idx: dict[str, dict] = {}
+    for inv in invs:
+        iid = str(inv["_id"])
+        prices = {(li.get("style_code"), li.get("color"), str(li.get("size") or "")):
+                  float(li.get("unit_price") or 0) for li in (inv.get("line_items_snapshot") or [])}
+        price_idx[iid] = prices
+
+    entries = []
+    for inv in invs:
+        d = inv.get("invoice_iso_date") or _invoice_iso_date(inv.get("invoice_date", ""))
+        entries.append({
+            "date": d,
+            "vch_type": "Invoice",
+            "vch_no": inv.get("invoice_no"),
+            "particulars": f"Inv {inv.get('invoice_no')} · {(inv.get('po_numbers') or [inv.get('po_number')])[0] or ''}",
+            "debit": float(inv.get("grand_total") or 0),
+            "credit": 0.0,
+            "ref_id": str(inv["_id"]),
+            "due_date": inv.get("due_date"),
+        })
+    for g in grns:
+        prices = price_idx.get(g.get("invoice_id", ""), {})
+        short_value = 0.0
+        for ln in g.get("line_items", []):
+            short = max(0, int(ln.get("dispatched_qty", 0)) - int(ln.get("accepted_qty", 0)))
+            unit = prices.get((ln.get("style_code"), ln.get("color"), str(ln.get("size") or ""))) or 0
+            short_value += short * unit
+        if short_value > 0:
+            entries.append({
+                "date": g.get("grn_date") or g.get("received_date") or "",
+                "vch_type": "GR Adj",
+                "vch_no": g.get("grn_no"),
+                "particulars": f"GRN {g.get('grn_no')} · short/rejected {g.get('total_dispatched',0) - g.get('total_accepted',0)} pcs",
+                "debit": 0.0,
+                "credit": round(short_value, 2),
+                "ref_id": str(g["_id"]),
+            })
+    for p in pays:
+        entries.append({
+            "date": p.get("payment_date") or "",
+            "vch_type": "Payment",
+            "vch_no": p.get("payment_no"),
+            "particulars": f"{p.get('mode')} · {p.get('reference', '')}".strip(" ·"),
+            "debit": 0.0,
+            "credit": float(p.get("amount") or 0),
+            "ref_id": str(p["_id"]),
+            "mode": p.get("mode"),
+            "reference": p.get("reference"),
+        })
+
+    entries.sort(key=lambda e: (e["date"] or "", e["vch_type"]))
+    bal = 0.0
+    for e in entries:
+        bal += float(e["debit"]) - float(e["credit"])
+        e["debit"] = round(float(e["debit"]), 2)
+        e["credit"] = round(float(e["credit"]), 2)
+        e["balance"] = round(bal, 2)
+        e["balance_type"] = "Dr" if bal >= 0 else "Cr"
+
+    # Aging buckets — based on still-open invoices
+    inv_ids = [str(d["_id"]) for d in invs]
+    pay_map = await _aggregate_payments_for_invoices(inv_ids)
+    grn_map = await _aggregate_grn_adjustments(inv_ids)
+    decorated = [_decorate_invoice(d, pay_map, grn_map) for d in invs]
+    today = datetime.now().date()
+    buckets = {"0-30": 0.0, "31-60": 0.0, "61-90": 0.0, "90+": 0.0}
+    bucket_count = {"0-30": 0, "31-60": 0, "61-90": 0, "90+": 0}
+    for r in decorated:
+        outstanding = float(r.get("outstanding") or 0)
+        if outstanding <= 0 or not r.get("due_date"):
+            continue
+        try:
+            due = datetime.fromisoformat(r["due_date"]).date()
+        except Exception:
+            continue
+        days_overdue = (today - due).days
+        if days_overdue <= 30:
+            k = "0-30"
+        elif days_overdue <= 60:
+            k = "31-60"
+        elif days_overdue <= 90:
+            k = "61-90"
+        else:
+            k = "90+"
+        buckets[k] += outstanding
+        bucket_count[k] += 1
+
+    total_invoiced = sum(float(r.get("net_amount") or 0) for r in decorated)
+    total_received = sum(float(r.get("received_amount") or 0) for r in decorated)
+
+    return {
+        "client_name": client_name,
+        "entries": entries,
+        "closing_balance": round(bal, 2),
+        "closing_balance_type": "Dr" if bal >= 0 else "Cr",
+        "totals": {
+            "invoiced": round(total_invoiced, 2),
+            "received": round(total_received, 2),
+            "outstanding": round(bal, 2),
+        },
+        "aging": [
+            {"bucket": k, "amount": round(v, 2), "count": bucket_count[k]}
+            for k, v in buckets.items()
+        ],
+        "invoices": decorated,
+    }
 
 
 # ---------- PACKING LIST ----------
