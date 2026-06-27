@@ -6,6 +6,8 @@ load_dotenv(Path(__file__).parent / ".env")
 import os
 import re
 import logging
+import asyncio
+import httpx
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal, Dict
 
@@ -39,6 +41,23 @@ api = APIRouter(prefix="/api")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ssk")
+
+# ---------- Keep Awake Job ----------
+async def keep_awake_job():
+    interval = 14 * 60
+    while True:
+        await asyncio.sleep(interval)
+        api_url = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")
+        try:
+            async with httpx.AsyncClient() as client:
+                res = await client.get(f"{api_url}/docs")
+                log.info(f"Self-ping status: {res.status_code}")
+        except Exception as e:
+            log.error(f"Error during self-ping: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(keep_awake_job())
 
 # ---------- Helpers ----------
 def now_iso() -> str:
