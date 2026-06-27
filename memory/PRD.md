@@ -81,3 +81,22 @@ Build a comprehensive local/cloud B2B footwear manufacturing ERP. Costing calcul
 ### Verified (iteration_13.json)
 - Backend: 19/19 pytest passed
 - Frontend: 100% (all critical flows verified: Invoices list, modal, GRN dialog, Payment dialog, Clients list, Tally Ledger modal with aging)
+
+## Iteration 14 (2026-02 — current fork) — Siyaram PO extraction
+**P0 fix: Multi-page Siyaram PO extraction**
+- `_siyaram_text_block_parse` walks the entire text stream of multi-page Siyaram POs (where the table header row appears only on page 1 and page 3 has no extractable table at all).
+- For each numeric data row (`<sr> <qty> PCS <rate> <disc> <cgst> <%> <%> <amount>`), the parser scans neighbouring lines (bounded by the previous/next numeric row) for:
+  - Description (`STYLE COLOR SIZE`) — prefer backward search to avoid stealing the next item's description.
+  - Material code chunks (e.g. `5ZEZP125WW` + `FLT11719888` → `5ZEZP125WWFLT11719888`).
+  - HSN code (defaults to footwear `64029990`).
+  - Handles the page-break variant where material + description share a single line (e.g. `FLTM7128455 ZFLWWWFLTM71 TAN 5`).
+- `_looks_like_siyaram(text)` heuristic dispatches to this parser before the legacy table parser.
+- `_split_color_size_from_desc` extended to accept space-separated descriptions (`STYLECODE COLOR SIZE`) in addition to the existing SHEIN comma-separated format.
+- `_HEADER_TOKENS` reordered + new `"material"` alias and `"total net value"` alias.
+- `_parse_meta` vendor-name detection rewritten: prefers the line right after `Vendor Name & Address:` and requires a corporate suffix (LLP / LTD / LIMITED / PVT / INC / CORP / LLC) so address fragments like `GARDEN MUMBAI MUMBAI 400071 MAHARASHTRA` no longer match.
+- `_finalise_totals` recognises Siyaram's `NET TOTAL` footer line to capture the grand total.
+
+### Verified (iteration_14)
+- Backend pytest: **68 passed, 4 skipped** (no regressions; all iteration 10/11/12/13 suites green).
+- New regression suite `test_iteration14_siyaram.py` (17 tests) pins the expected 32 line items / 2088 qty / ₹333,440 grand total for the supplied PO `2220008835`.
+- End-to-end POST `/api/pos/extract` via httpx returns 32 line items with full style_code, description, color, size, qty, rate, amount.

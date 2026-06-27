@@ -109,7 +109,16 @@ def _extract_pdf(file_bytes: bytes) -> dict:
         raise ExtractionFailed("PDF has no extractable text (scanned image?). Try Excel or LLM extractor.")
 
     data = _parse_meta(full_text)
-    line_items = _parse_line_items_from_tables(all_tables, data.get("po_number", ""))
+
+    # Siyaram-style POs span multiple pages without repeating the header row,
+    # and Page-3 frequently has no extractable table. For those, parse the
+    # entire text stream as line-item blocks instead of relying on tables.
+    line_items: list[dict] = []
+    if _looks_like_siyaram(full_text):
+        line_items = _siyaram_text_block_parse(full_text)
+
+    if not line_items:
+        line_items = _parse_line_items_from_tables(all_tables, data.get("po_number", ""))
     # If the table parser found nothing meaningful, try a text-based fallback
     if not line_items:
         line_items = _parse_line_items_from_text(full_text)
@@ -168,11 +177,32 @@ def _parse_meta(text: str) -> dict:
                     client_name = ln
                     break
 
-    # Vendor / seller detection — strongest signal first: line after "Vendor Code : <digits>"
+    # Vendor / seller detection — try strongest signals first:
+    #   1. Line right after a ``Vendor Name & Address:`` label
+    #   2. Line right after ``Vendor Code : <digits>``
+    #   3. Generic ``Vendor / Supplier / Seller`` labelled blocks
+    # In every case the candidate must look like a corporate name (contain a
+    # suffix such as LLP, LTD, LIMITED, PVT, INC etc.) so address fragments
+    # like ``GARDEN MUMBAI MUMBAI 400071 MAHARASHTRA`` get rejected.
+    _CORP_SUFFIX = r"(?:LLP|LTD|LTD\.|LIMITED|INC|PVT|PRIVATE|CO\.?|COMPANY|CORP|CORPORATION|LLC)"
     vendor_name = ""
-    m = re.search(r"Vendor\s*Code\s*[:\-|]\s*\d+[^\n]*\n([A-Z][A-Z0-9 &.,'\-/]{4,80})", text, flags=re.I)
-    if m:
-        vendor_name = _norm(m.group(1))
+    for pat in [
+        r"Vendor\s+Name\s*(?:&\s*Address)?\s*[:\-|][^\n]*\n([A-Z][A-Z0-9 &.,'\-/]{3,80}\s+" + _CORP_SUFFIX + r"\b[A-Z0-9 &.,'\-/]*)",
+        r"Vendor\s*Code\s*[:\-|]\s*\d+[^\n]*\n([A-Z][A-Z0-9 &.,'\-/]{3,80}\s+" + _CORP_SUFFIX + r"\b[A-Z0-9 &.,'\-/]*)",
+    ]:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            vendor_name = _norm(m.group(1))
+            break
+
+    # Legacy fallback: original ``Vendor Code: <digits>\n<next-line>`` heuristic.
+    if not vendor_name:
+        m = re.search(r"Vendor\s*Code\s*[:\-|]\s*\d+[^\n]*\n([A-Z][A-Z0-9 &.,'\-/]{4,80})", text, flags=re.I)
+        if m:
+            cand = _norm(m.group(1))
+            # Reject pure-address lines (eg. ``GARDEN MUMBAI MUMBAI 400071 MAHARASHTRA``)
+            if not re.search(r"\b\d{6}\b", cand):
+                vendor_name = cand
 
     if not vendor_name:
         for pat in [
@@ -205,16 +235,23 @@ def _parse_meta(text: str) -> dict:
 
 
 # ---------- line-item table detection ----------
+# Order matters — first match wins in `_classify_header`. We put longer/more-
+# specific keys ("description") ahead of shorter generic ones ("style") so a
+# cell like "Material Description" classifies as description, while a cell
+# that literally says just "Material" falls through to style.
 _HEADER_TOKENS = {
-    "style": ["style", "article", "articleno", "article no", "model", "item code", "sku"],
-    "description": ["description", "particulars", "item name", "product", "materialdescription", "material description"],
+    "description": ["description", "particulars", "item name", "product",
+                    "materialdescription", "material description", "matdesc"],
+    "style": ["style", "article", "articleno", "article no", "model",
+              "item code", "sku", "material"],
     "color": ["color", "colour", "shade"],
     "size": ["size", "uk size"],
     "hsn": ["hsn", "sac", "hsn code", "hsncode"],
     "quantity": ["quantity", "qty", "pcs", "pairs"],
     "unit_price": ["basecost", "base cost", "rate", "unit price", "unit rate"],
     "mrp": ["mrp"],
-    "amount": ["totalbasevalue", "total base value", "amount", "total value", "net amount", "totalvalue"],
+    "amount": ["totalbasevalue", "total base value", "amount", "total value",
+               "net amount", "totalvalue", "totalnetvalue", "total net value"],
 }
 
 # Junk tokens we never want as a field
@@ -236,17 +273,33 @@ def _classify_header(cell: str) -> str | None:
 
 
 def _split_color_size_from_desc(desc: str) -> tuple[str, str, str]:
-    """If `desc` has comma-separated trailing pieces, take the last as size,
-    second-to-last as color, the rest as description.
+    """Extract (description, color, size) from a single description string.
 
-    Returns (description, color, size). Never raises."""
+    Handles two formats:
+    - Comma-separated: ``STYLECODE,COLOR,SIZE`` (SHEIN) or ``STYLECODE,SIZE``.
+    - Space-separated: ``STYLECODE COLOR SIZE`` where SIZE is a small numeric
+      token at the end and COLOR is the trailing UPPER-CASE word(s) before it
+      (Siyaram). Color may span up to 3 words (eg. ``DARK NAVY BLUE``).
+
+    Returns (description, color, size). Never raises.
+    """
     if not desc:
         return "", "", ""
-    parts = [p.strip() for p in desc.split(",")]
-    if len(parts) >= 3:
-        return ",".join(parts[:-2]).strip(), parts[-2], parts[-1]
-    if len(parts) == 2:
-        return parts[0], parts[1], ""
+    s = desc.strip()
+
+    # Try comma-separated first (most reliable)
+    if "," in s:
+        parts = [p.strip() for p in s.split(",")]
+        if len(parts) >= 3:
+            return ",".join(parts[:-2]).strip(), parts[-2], parts[-1]
+        if len(parts) == 2:
+            return parts[0], parts[1], ""
+
+    # Try space-separated: ``...  COLOR  SIZE`` (size = small int, optional .5)
+    m = re.match(r"^(.+?)\s+([A-Z][A-Z]{1,15}(?:\s+[A-Z]{2,15}){0,2})\s+(\d{1,2}(?:\.\d)?)\s*$", s)
+    if m:
+        return m.group(1).strip(), m.group(2).strip(), m.group(3)
+
     return desc, "", ""
 
 
@@ -365,6 +418,185 @@ def _parse_line_items_from_text(text: str) -> list[dict]:
     return items
 
 
+# ---------- Siyaram-style multi-page block parser ----------
+# Siyaram POs have line items that span multiple pages, where the table header
+# row only appears on page 1 and individual rows are visually split across
+# multiple lines (Material code on its own line, description on another, the
+# numeric row with qty / rate / amount, then a ``DlvrQty: ... HSN: ...`` block).
+# pdfplumber's table detection often fails for pages 2+, so we parse straight
+# from the text stream by detecting numeric rows of the shape
+#   ``<SR> [<INLINE_MAT>] <QTY> PCS <RATE> <DISC> <CGST_AMT> <CGST%> <SGST%> <AMOUNT>``
+# and scanning neighbouring lines for description (``STYLE COLOR SIZE``),
+# material code chunks, and the HSN code.
+
+_SIYARAM_NUMERIC_RE = re.compile(
+    r"^(\d+)(?:\s+([A-Z0-9]{4,20}))?\s+(\d+)\s+PCS\s+([\d.,]+)\s+\d+\s+([\d.,]+)\s+\d+\s+\d+\s+([\d,]+(?:\.\d+)?)\s*$"
+)
+_SIYARAM_DESC_RE = re.compile(
+    r"^([A-Z][A-Z0-9_-]{4,})\s+([A-Z][A-Z ]{1,20}?)\s+(\d{1,2}(?:\.\d)?)\s*$"
+)
+# Variant where a material-code chunk and the description live on the same
+# physical line (Siyaram page-break behaviour for the first item of a new
+# page): ``FLTM7128455 ZFLWWWFLTM71 TAN 5``.
+_SIYARAM_MAT_PLUS_DESC_RE = re.compile(
+    r"^([A-Z0-9]{5,20})\s+([A-Z][A-Z0-9_-]{4,})\s+([A-Z][A-Z ]{1,20}?)\s+(\d{1,2}(?:\.\d)?)\s*$"
+)
+_SIYARAM_MAT_RE = re.compile(r"^(?=[A-Z0-9]*[A-Z])[A-Z0-9]{5,20}$")
+_SIYARAM_HSN_RE = re.compile(r"HSN[:\s]+(\d{4,10})")
+
+
+def _looks_like_siyaram(text: str) -> bool:
+    """Heuristic detector for the Siyaram multi-line PO layout.
+
+    Returns True when the text has at least two ``DlvrQty:`` and ``HSN:``
+    markers AND at least two numeric rows shaped like
+    ``<sr> <qty> PCS <rate> ...`` — these are exclusive to that layout.
+    """
+    if len(re.findall(r"DlvrQty\s*:\s*[\d.]+", text)) < 2:
+        return False
+    if len(re.findall(r"\bHSN\s*[:\-]\s*\d", text)) < 2:
+        return False
+    numeric_rows = sum(
+        1 for ln in text.splitlines() if _SIYARAM_NUMERIC_RE.match(_norm(ln))
+    )
+    return numeric_rows >= 2
+
+
+def _siyaram_text_block_parse(text: str) -> list[dict]:
+    """Parse Siyaram-style POs from a free-form text stream.
+
+    For each numeric data row, scan a small window of surrounding lines for
+    the description (``STYLE COLOR SIZE``), material code chunks (typically
+    two short alphanumeric tokens that concatenate to the full style code),
+    and the HSN code. Returns one dict per line item.
+    """
+    lines = [_norm(ln) for ln in text.splitlines()]
+    n = len(lines)
+    items: list[dict] = []
+    used_desc: set[int] = set()
+    used_mat: set[int] = set()
+
+    # Indexes of every numeric row, so the per-row material search can stop
+    # at the boundary of the previous/next item and not steal codes that
+    # belong to another row.
+    numeric_idx = [i for i, ln in enumerate(lines) if _SIYARAM_NUMERIC_RE.match(ln)]
+    if not numeric_idx:
+        return []
+
+    for slot, i in enumerate(numeric_idx):
+        nm = _SIYARAM_NUMERIC_RE.match(lines[i])
+        if not nm:
+            continue
+        inline_mat = nm.group(2) or ""
+        qty = int(nm.group(3))
+        rate = _to_number(nm.group(4))
+        amount = _to_number(nm.group(6))
+        if qty <= 0 or rate <= 0:
+            continue
+
+        # Bound the search window by neighbouring numeric rows so we never
+        # grab description / material lines that belong to another item.
+        prev_i = numeric_idx[slot - 1] if slot > 0 else -1
+        next_i = numeric_idx[slot + 1] if slot + 1 < len(numeric_idx) else n
+        lo = max(prev_i + 1, i - 6)
+        hi = min(next_i, i + 7)
+
+        # --- description: prefer the *closest BACKWARD* line, then forward.
+        # In Siyaram POs the description normally sits 1-2 lines ABOVE the
+        # numeric row. Without this preference, the description for the next
+        # item (which can be just below ours) gets consumed by our slot.
+        # Also support the page-break variant where material + description
+        # share one line (e.g. ``FLTM7128455 ZFLWWWFLTM71 TAN 5``).
+        desc, color, size = "", "", ""
+        consumed_desc_dj = -1
+        consumed_mat_from_desc_dj = -1
+        mat_from_desc = ""
+
+        # 1. Try backward first (numeric row -> back to lo)
+        for dj in range(i - 1, lo - 1, -1):
+            if dj in used_desc:
+                continue
+            ln = lines[dj]
+            dm = _SIYARAM_DESC_RE.match(ln)
+            if dm:
+                desc, color, size = dm.group(1), dm.group(2).strip(), dm.group(3)
+                consumed_desc_dj = dj
+                break
+            mm = _SIYARAM_MAT_PLUS_DESC_RE.match(ln)
+            if mm:
+                mat_from_desc = mm.group(1)
+                desc, color, size = mm.group(2), mm.group(3).strip(), mm.group(4)
+                consumed_desc_dj = dj
+                consumed_mat_from_desc_dj = dj
+                break
+
+        # 2. Fallback to forward search
+        if consumed_desc_dj < 0:
+            for dj in range(i + 1, hi):
+                if dj in used_desc:
+                    continue
+                ln = lines[dj]
+                dm = _SIYARAM_DESC_RE.match(ln)
+                if dm:
+                    desc, color, size = dm.group(1), dm.group(2).strip(), dm.group(3)
+                    consumed_desc_dj = dj
+                    break
+                mm = _SIYARAM_MAT_PLUS_DESC_RE.match(ln)
+                if mm:
+                    mat_from_desc = mm.group(1)
+                    desc, color, size = mm.group(2), mm.group(3).strip(), mm.group(4)
+                    consumed_desc_dj = dj
+                    consumed_mat_from_desc_dj = dj
+                    break
+
+        if consumed_desc_dj >= 0:
+            used_desc.add(consumed_desc_dj)
+        if consumed_mat_from_desc_dj >= 0:
+            used_mat.add(consumed_mat_from_desc_dj)
+        best_dj = consumed_desc_dj  # for downstream skip in material loop
+
+        # --- material chunks (up to 2 short alphanumeric tokens) ---
+        material_chunks: list[str] = []
+        if inline_mat and _SIYARAM_MAT_RE.match(inline_mat):
+            material_chunks.append(inline_mat)
+        if mat_from_desc and mat_from_desc not in material_chunks:
+            material_chunks.append(mat_from_desc)
+        for dj in range(lo, hi):
+            if dj == i or dj == best_dj or dj in used_mat:
+                continue
+            ln = lines[dj]
+            if _SIYARAM_MAT_RE.match(ln) and ln not in material_chunks:
+                material_chunks.append(ln)
+                used_mat.add(dj)
+                if len(material_chunks) >= 2:
+                    break
+
+        # --- HSN ---
+        hsn = ""
+        for dj in range(lo, hi):
+            hm = _SIYARAM_HSN_RE.search(lines[dj])
+            if hm:
+                hsn = hm.group(1)
+                break
+
+        style_code = "".join(material_chunks)
+        full_desc = " ".join(p for p in (desc, color, size) if p).strip()
+        items.append({
+            "style_code": style_code,
+            "description": full_desc,
+            "color": color,
+            "size": size,
+            "hsn_code": hsn or _HSN_CODES_FOOTWEAR,
+            "quantity": qty,
+            "unit_price": rate,
+            "amount": amount if amount > 0 else round(qty * rate, 2),
+            "mrp": "",
+        })
+    return items
+
+
+
+
 def _finalise_totals(data: dict, full_text: str) -> None:
     items = data.get("line_items", [])
     subtotal = sum(li.get("amount", 0) for li in items)
@@ -383,6 +615,9 @@ def _finalise_totals(data: dict, full_text: str) -> None:
         r"Total\s*Order\s*Value\s*[:\-]?\s*(?:INR|Rs\.?)?\s*([0-9][0-9,]+(?:\.\d+)?)",
         r"TOTAL\s*BASIC\s*VALUE\s*(?:INR|Rs\.?)?\s*([0-9][0-9,]+(?:\.\d+)?)",
         r"(?:Grand\s*Total|Net\s*Payable|Total\s*Amount|Net\s*Value)\s*[:\-]?\s*(?:INR|Rs\.?)?\s*([0-9][0-9,]+(?:\.\d+)?)",
+        # Siyaram footer: ``NET TOTAL 2,088 16,672 0 333,440`` — grab the last
+        # number on the line (largest = grand total)
+        r"(?im)^\s*NET\s*TOTAL[^\n]*?([0-9][0-9,]+(?:\.\d+)?)\s*$",
     ]:
         m = re.search(pat, full_text, flags=re.I)
         if m:
