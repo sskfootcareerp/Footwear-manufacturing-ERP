@@ -166,7 +166,7 @@ async def log_activity(action: str, category: str, details: str, email: str):
 
 
 # ---------- Pydantic models ----------
-Role = Literal["admin", "manager", "production", "sales"]
+Role = Literal["admin", "manager", "production", "sales", "operator"]
 
 class LoginInput(BaseModel):
     email: EmailStr
@@ -6650,21 +6650,31 @@ def _make_location_code(rack: str, row: int, col: int) -> str:
 
 
 async def _seed_warehouse_locations():
-    """Idempotent — inserts any missing cells into warehouse_locations."""
+    """Idempotent — inserts any missing cells into warehouse_locations.
+
+    Zones:
+    • main            — default for all cells; used by production_in, dispatched, etc.
+    • return_holding  — reserved bay for `return_in` movements (post-inspection returns
+                        move from here to main via `return_restocked`).
+                        Default: last row of rack D (D-10-01 through D-10-08 = 240 pair cap).
+    """
     to_upsert = []
     for rack in RACKS:
         for r in range(1, ROWS_PER + 1):
             for c in range(1, COLS_PER + 1):
                 code = _make_location_code(rack, r, c)
+                zone = "return_holding" if (rack == "D" and r == 10) else "main"
                 to_upsert.append({
                     "location_code":   code,
                     "rack":            rack,
                     "row":             r,
                     "column":          c,
+                    "zone":            zone,
                     "capacity_pairs":  CAPACITY,
                     "occupied_pairs":  0,
                     "available_pairs": CAPACITY,
                     "status":          "empty",  # empty | partial | full | blocked
+                    "block_reason":    None,
                     "created_at":      now_iso(),
                     "updated_at":      now_iso(),
                 })
@@ -6672,11 +6682,21 @@ async def _seed_warehouse_locations():
     for doc in to_upsert:
         res = await db.warehouse_locations.update_one(
             {"location_code": doc["location_code"]},
-            {"$setOnInsert": doc},
+            {"$setOnInsert": doc,
+             # Backfill zone on legacy cells that never had it
+             "$set": {} if False else {}},
             upsert=True,
         )
         if res.upserted_id:
             inserted += 1
+    # Backfill zone for any pre-existing cells that lack it
+    await db.warehouse_locations.update_many(
+        {"zone": {"$exists": False}},
+        [{"$set": {"zone": {"$cond": [
+            {"$and": [{"$eq": ["$rack", "D"]}, {"$eq": ["$row", 10]}]},
+            "return_holding", "main"
+        ]}}}]
+    )
     return inserted
 
 
@@ -6689,19 +6709,20 @@ def _recompute_status(occupied: int, capacity: int) -> str:
 
 
 async def _allocate_to_locations(style_id, style_code, color, size, qty, user_email,
-                                  reference_type="", reference_id=""):
-    """Sequentially fill cells (by location_code ASC) until qty placed."""
+                                  reference_type="", reference_id="", zone="main"):
+    """Sequentially fill cells (by location_code ASC) until qty placed.
+    zone: 'main' (default) or 'return_holding'."""
     remaining = int(qty)
     placements = []
     guard = 0
     while remaining > 0 and guard < 500:
         guard += 1
         loc = await db.warehouse_locations.find_one(
-            {"available_pairs": {"$gt": 0}, "status": {"$ne": "blocked"}},
+            {"available_pairs": {"$gt": 0}, "status": {"$ne": "blocked"}, "zone": zone},
             sort=[("location_code", 1)],
         )
         if not loc:
-            log.warning(f"WMS: warehouse full — {remaining} pairs unplaced for {style_code}/{color}/{size}")
+            log.warning(f"WMS: {zone} zone full — {remaining} pairs unplaced for {style_code}/{color}/{size}")
             break
         place_qty = min(remaining, int(loc["available_pairs"]))
         new_occupied  = int(loc["occupied_pairs"]) + place_qty
@@ -6729,7 +6750,8 @@ async def _allocate_to_locations(style_id, style_code, color, size, qty, user_em
             upsert=True,
         )
         placements.append({"location_code": loc["location_code"], "qty": place_qty,
-                            "rack": loc["rack"], "row": loc["row"], "column": loc["column"]})
+                            "rack": loc["rack"], "row": loc["row"], "column": loc["column"],
+                            "zone": zone})
         remaining -= place_qty
     return {"placed_qty": int(qty) - remaining, "unplaced_qty": remaining, "placements": placements}
 
@@ -6822,18 +6844,34 @@ async def _sync_warehouse_locations(payload, user_email):
     ref = payload.reference_type
     ref_id = payload.reference_id or ""
 
-    if mt in ("production_in", "return_restocked"):
+    if mt in ("production_in",):
         if qty > 0:
             return await _allocate_to_locations(style_id, style_code, color, size, qty,
-                                                 user_email, ref, ref_id)
-    elif mt in ("dispatched", "liquidation_out"):
+                                                 user_email, ref, ref_id, zone="main")
+    elif mt == "return_restocked":
+        # Returns cleared inspection — put back into main zone
+        if qty > 0:
+            # Also try to remove from return_holding zone (best-effort)
+            try:
+                await _deduct_from_locations(style_id, color, size, qty,
+                                              user_email, ref, ref_id)
+            except Exception:
+                pass
+            return await _allocate_to_locations(style_id, style_code, color, size, qty,
+                                                 user_email, ref, ref_id, zone="main")
+    elif mt == "return_in":
+        # Fresh return — quarantine in return_holding zone
+        if qty > 0:
+            return await _allocate_to_locations(style_id, style_code, color, size, qty,
+                                                 user_email, ref, ref_id, zone="return_holding")
+    elif mt in ("dispatched", "liquidation_out", "return_damaged"):
         if qty > 0:
             return await _deduct_from_locations(style_id, color, size, qty,
                                                  user_email, ref, ref_id)
     elif mt == "adjustment" and payload.adjustment_field == "ready_stock_qty":
         if qty > 0:
             return await _allocate_to_locations(style_id, style_code, color, size, qty,
-                                                 user_email, ref, ref_id)
+                                                 user_email, ref, ref_id, zone="main")
         elif qty < 0:
             return await _deduct_from_locations(style_id, color, size, abs(qty),
                                                  user_email, ref, ref_id)
@@ -6847,6 +6885,7 @@ async def wms_list_locations(
     request: Request,
     rack: Optional[str] = None,
     status: Optional[str] = None,
+    zone: Optional[str] = None,
     search: Optional[str] = None,
 ):
     """List all warehouse cells with capacity/occupied stats. Filterable."""
@@ -6854,9 +6893,37 @@ async def wms_list_locations(
     q = {}
     if rack: q["rack"] = rack.upper()
     if status: q["status"] = status
+    if zone:   q["zone"] = zone
     if search: q["location_code"] = {"$regex": search, "$options": "i"}
     docs = await db.warehouse_locations.find(q).sort("location_code", 1).to_list(500)
     return [stringify(d) for d in docs]
+
+
+class LocationBlockIn(BaseModel):
+    blocked: bool
+    reason: Optional[str] = None
+
+
+@api.patch("/warehouse/locations/{code}/block")
+async def wms_block_location(request: Request, code: str, payload: LocationBlockIn):
+    """Block or unblock a cell for repairs / maintenance / damage."""
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    code = code.upper().strip()
+    loc = await db.warehouse_locations.find_one({"location_code": code})
+    if not loc:
+        raise HTTPException(404, "Location not found")
+    if payload.blocked:
+        new_status = "blocked"
+        upd = {"status": new_status, "block_reason": payload.reason or "manually blocked",
+               "blocked_at": now_iso(), "blocked_by": u["email"], "updated_at": now_iso()}
+    else:
+        new_status = _recompute_status(int(loc["occupied_pairs"]), int(loc["capacity_pairs"]))
+        upd = {"status": new_status, "block_reason": None,
+               "blocked_at": None, "blocked_by": None, "updated_at": now_iso()}
+    await db.warehouse_locations.update_one({"_id": loc["_id"]}, {"$set": upd})
+    await log_activity("UPDATE", "warehouse_locations",
+                        f"{'Blocked' if payload.blocked else 'Unblocked'} {code}: {payload.reason or '-'}", u["email"])
+    return stringify(await db.warehouse_locations.find_one({"_id": loc["_id"]}))
 
 
 @api.get("/warehouse/locations/{code}")
@@ -6942,6 +7009,25 @@ async def wms_dashboard(request: Request):
     distinct_skus = len(await db.fg_location_inventory.distinct("style_id"))
 
     utilization_pct = round((total_occupied / total_capacity * 100), 2) if total_capacity else 0
+
+    # Zone breakdown
+    main_locs = [l for l in locs if l.get("zone", "main") == "main"]
+    ret_locs  = [l for l in locs if l.get("zone") == "return_holding"]
+    by_zone = {
+        "main": {
+            "cells":           len(main_locs),
+            "capacity_pairs":  sum(int(l.get("capacity_pairs", 0)) for l in main_locs),
+            "occupied_pairs":  sum(int(l.get("occupied_pairs", 0)) for l in main_locs),
+            "available_pairs": sum(int(l.get("available_pairs", 0)) for l in main_locs),
+        },
+        "return_holding": {
+            "cells":           len(ret_locs),
+            "capacity_pairs":  sum(int(l.get("capacity_pairs", 0)) for l in ret_locs),
+            "occupied_pairs":  sum(int(l.get("occupied_pairs", 0)) for l in ret_locs),
+            "available_pairs": sum(int(l.get("available_pairs", 0)) for l in ret_locs),
+        },
+    }
+
     return {
         "total_cells":       total_cells,
         "total_capacity":    total_capacity,
@@ -6957,6 +7043,7 @@ async def wms_dashboard(request: Request):
         "pending_picklists": pending_picklists,
         "completed_today":   completed_today,
         "by_rack":           by_rack,
+        "by_zone":           by_zone,
     }
 
 
@@ -7138,7 +7225,7 @@ async def create_picklist(request: Request, payload: PicklistIn):
 
 @api.patch("/picklists/{pid}")
 async def patch_picklist(request: Request, pid: str, payload: PicklistPatchIn):
-    u = await get_current_user(request); require_roles("admin", "manager", "production")(u)
+    u = await get_current_user(request); require_roles("admin", "manager", "production", "operator")(u)
     upd = {"updated_at": now_iso()}
     if payload.picker is not None: upd["picker"] = payload.picker
     if payload.status is not None: upd["status"] = payload.status
@@ -7155,7 +7242,7 @@ async def patch_picklist(request: Request, pid: str, payload: PicklistPatchIn):
 @api.post("/picklists/{pid}/pick-item")
 async def pick_item(request: Request, pid: str, payload: PickItemIn):
     """Confirm a pick: verify scan matches, deduct from that specific location."""
-    u = await get_current_user(request); require_roles("admin", "manager", "production")(u)
+    u = await get_current_user(request); require_roles("admin", "manager", "production", "operator")(u)
     try:
         doc = await db.picklists.find_one({"_id": ObjectId(pid)})
     except Exception:

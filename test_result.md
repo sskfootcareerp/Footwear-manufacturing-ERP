@@ -500,3 +500,108 @@ agent_communication:
     
     - agent: "testing"
       message: "✅ PHASE 6.1 COMPONENT INVENTORY BACKEND TESTING COMPLETE — ALL 12/12 TESTS PASSED (100% success rate). Comprehensive verification of all Phase 6.1 endpoints completed successfully. All 13 requirements from review request verified: (1) POST /api/components with opening balance → creates row with derived fields, generates opening_balance ledger entry, rejects duplicates (409), invalid category (422), negative stock (400) ✓ (2) GET /api/components with filters (code, category, color, size, active, low_stock, search) all working, available_stock derived correctly ✓ (3) PUT /api/components/{id} updates metadata only, stock counters unchanged ✓ (4) DELETE /api/components/{id} soft-deletes (active=false), refuses if stock > 0, succeeds after zeroing via adjustment ✓ (5) POST /api/components/bulk-matrix creates multiple (color, size) rows, skips existing, generates opening_balance ledger for rows with opening_qty > 0 ✓ (6) POST /api/components/movements — ALL 8 MOVEMENT TYPES tested: purchase_in, return_in, adjustment (increase/decrease with adjustment_dir required), production_reserve, online_reserve, unreserve, production_issue, online_issue. Over-reserve blocked, unreserve > reserved blocked, issue > reserved blocked. Ledger reconciliation verified (sum of deltas matches current state). All required ledger fields present ✓ (7) GET /api/components/movements with filters (component_id, movement_type, style_id, reference_type), sorted DESC by created_at ✓ (8) POST /api/style-component-mapping creates BOM link, denormalises component_category, rejects duplicate (409), missing style/component (404) ✓ (9) GET /api/style-component-mapping with filters (style_id, component_id reverse join), denormalises all required fields (style_code, style_name, component_code, component_name, component_category, component_color, component_size, current_stock, reserved_stock, available_stock) ✓ (10) PUT /api/style-component-mapping/{id} updates qty/wastage/active ✓ (11) DELETE /api/style-component-mapping/{id} removes mapping ✓ (12) Indexes verified: component_master unique on (component_code, color, size), style_component_mapping unique on (style_id, component_id) — both return 409 on duplicate ✓ (13) Regression smoke: GET /api/styles, GET /api/fg-inventory, GET /api/sku-map, GET /api/style-lifecycle/{style_id}, GET /api/styles/online all work ✓ NO ISSUES FOUND. All Phase 6.1 Component Inventory endpoints working perfectly as specified. Test file: /app/backend_test_phase6.py"
+
+
+backend:
+  - task: "WMS Enhancements — Return-holding zone (8 cells in rack D row 10)"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: "✅ RETURN-HOLDING ZONE VERIFIED. GET /api/warehouse/dashboard returns by_zone object with 'main' (312 cells, capacity=9360) and 'return_holding' (8 cells, capacity=240) zones ✓ GET /api/warehouse/locations?zone=return_holding returns exactly 8 rows, all with rack=D, row=10, column=1..8, location_code=D-10-01 through D-10-08 ✓ GET /api/warehouse/locations?zone=main returns 312 rows ✓ All return_holding locations have zone='return_holding' field ✓"
+
+  - task: "WMS Enhancements — Return-in allocation to return_holding zone"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: "✅ RETURN-IN ALLOCATION VERIFIED. POST /api/fg-inventory/movements with movement_type=return_in, quantity=20 → response.warehouse.placements shows zone='return_holding' and location_code starts with 'D-10-' ✓ GET /api/warehouse/fg-locations?style_id={id} shows the return quantity at D-10-* locations ✓ GET /api/warehouse/dashboard.by_zone.return_holding.occupied_pairs increased by 20 pairs as expected ✓ All placements correctly allocated to return_holding zone (D-10-01, D-10-02, etc.) ✓"
+
+  - task: "WMS Enhancements — Production-in still uses main zone (not return_holding)"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: "✅ PRODUCTION-IN MAIN ZONE VERIFIED. POST /api/fg-inventory/movements with movement_type=production_in, quantity=30 → response.warehouse.placements shows zone='main' ✓ All placements are in racks A/B/C or rack D but NOT row 10 (return_holding) ✓ GET /api/warehouse/dashboard shows return_holding.occupied_pairs unchanged, main.occupied_pairs increased by 30 ✓ Production-in correctly avoids return_holding zone ✓"
+
+  - task: "WMS Enhancements — Block/unblock endpoint and allocation skips blocked cells"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: "✅ BLOCK/UNBLOCK ENDPOINT VERIFIED. PATCH /api/warehouse/locations/B-01-01/block with {blocked: true, reason: 'test block'} → 200 with status='blocked', block_reason='test block', blocked_at timestamp, blocked_by email ✓ POST /api/fg-inventory/movements production_in with large qty (100 pairs) → sequential allocation SKIPS blocked B-01-01 cell, allocations go to A-* cells then B-01-02+ directly ✓ Blocked cell B-01-01 NOT present in placements array ✓ PATCH /api/warehouse/locations/B-01-01/block with {blocked: false} → 200 with status='empty' (recomputed based on occupied_pairs), block_reason=null, blocked_at=null, blocked_by=null ✓ Allocation correctly skips blocked cells as specified ✓"
+
+  - task: "WMS Enhancements — Operator role permissions"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: "✅ OPERATOR ROLE PERMISSIONS VERIFIED. Created operator user with role='operator' ✓ Operator CAN call PATCH /api/picklists/{id} (assign self as picker) → 200 ✓ Operator CAN call POST /api/picklists/{id}/pick-item → 200 ✓ Operator CAN read GET /api/warehouse/dashboard → 200 ✓ Operator CAN read GET /api/warehouse/locations → 200 ✓ Operator CAN read GET /api/picklists → 200 ✓ Operator CAN read GET /api/production/pending-list → 200 ✓ Operator CANNOT call POST /api/picklists → 403 ✓ Operator CANNOT call PATCH /api/warehouse/locations/{code}/block → 403 ✓ Operator CANNOT call DELETE /api/picklists/{id} → 403 ✓ All operator role permissions working as specified ✓"
+
+  - task: "WMS Enhancements — Return_restocked flow (return_holding → main zone)"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: "✅ RETURN_RESTOCKED FLOW VERIFIED. POST /api/fg-inventory/movements with movement_type=return_in, quantity=10 → allocated to return_holding zone (D-10-05) ✓ GET /api/warehouse/dashboard shows return_holding.occupied_pairs increased by 10 ✓ POST /api/fg-inventory/movements with movement_type=return_restocked, quantity=10 (same SKU) → allocated to main zone (A-05-01, A-05-02) ✓ GET /api/warehouse/dashboard shows return_holding.occupied_pairs decreased back to original, main.occupied_pairs increased by 10 ✓ GET /api/warehouse/fg-locations?style_id={id} shows locations in main zone after restock ✓ Both fg_location_inventory rows updated correctly (return_holding qty decremented, main zone qty incremented) ✓ Return_restocked flow correctly moves stock from return_holding to main zone ✓"
+
+  - task: "WMS Enhancements — Full regression flow (style creation → production_in → sku-map → online-order import → picklist → pick-item → dispatched)"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: "✅ FULL REGRESSION FLOW VERIFIED. Created unique style (WMS-REG-*) ✓ POST /api/fg-inventory/movements production_in 50 pairs → all placed in main zone (not return_holding) ✓ Created SKU map (source_type=online_channel, source_name=flipkart) ✓ POST /api/online-orders/import with CSV (30 pairs) → order imported successfully ✓ NOTE: Online order import did NOT create picklists automatically (fulfilled_from_stock=0) — this appears to be a bug in the WMS integration where the import code is not finding available stock in fg_location_inventory despite stock being present. Workaround: Manually created picklist via POST /api/picklists → 200 with picklist created ✓ GET /api/picklists/{id} shows items with location_code from main zone (not D-10-*) ✓ POST /api/picklists/{id}/pick-item with correct scanned_location → 200, item.picked=true, item.picked_at timestamp present ✓ GET /api/fg-inventory/movements?movement_type=dispatched shows dispatched movement recorded ✓ Full regression flow working except for online order import picklist auto-generation (known bug) ✓"
+
+  - task: "WMS Enhancements — Online order import picklist auto-generation bug"
+    implemented: true
+    working: false
+    file: "backend/server.py"
+    stuck_count: 1
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        - working: false
+          agent: "testing"
+          comment: "❌ BUG FOUND: POST /api/online-orders/import does NOT create picklists automatically even when stock is available in fg_location_inventory. Test scenario: Created style, added 10 pairs via production_in movement (verified in fg_location_inventory with qty=10, reserved_qty=0), created SKU map, imported online order for 5 pairs. Expected: fulfilled_from_stock=5, picklists_created=[1 picklist]. Actual: fulfilled_from_stock=0, picklists_created=[]. The online order import code at lines 5239-5276 in server.py queries fg_location_inventory to check available stock, but the query is not finding the records despite them existing in the database. Root cause: Unknown - the query logic looks correct (style_id ObjectId match, color/size match, qty > 0). Possible issues: (1) ObjectId conversion mismatch, (2) Color/size case sensitivity, (3) Missing reserved_qty field initialization in fg_location_inventory records, (4) Zone filtering issue. RECOMMENDATION: Debug the online order import code to identify why fg_location_inventory query is not returning results. Add logging to see what the query is finding. This is blocking the full WMS integration flow where online orders should automatically create picklists from ready stock."
+
+agent_communication:
+    - agent: "main"
+      message: "WMS Enhancements implemented (return-holding zone, block/unblock, operator role). Please regression test: (1) GET /api/warehouse/dashboard should include by_zone with main (312 cells) and return_holding (8 cells in D-10-01..D-10-08). (2) POST /api/fg-inventory/movements return_in should allocate to return_holding zone (D-10-*). (3) POST /api/fg-inventory/movements production_in should use main zone (not return_holding). (4) PATCH /api/warehouse/locations/{code}/block should block/unblock cells, and allocation should skip blocked cells. (5) Create operator user and verify permissions: CAN pick-item, PATCH picklist, read dashboard/locations/picklists/pending-list; CANNOT POST picklists, block locations, DELETE picklists. (6) Return_restocked flow: return_in to return_holding, then return_restocked moves to main zone. (7) Full regression: style creation → production_in → sku-map → online-order import → picklist → pick-item → dispatched. Admin login: admin@example.com / admin123."
+    
+    - agent: "testing"
+      message: "✅ WMS ENHANCEMENTS REGRESSION TESTING COMPLETE — 7/8 TESTS PASSED (87.5% success rate). Test file: /app/backend_test_wms_enhancements.py. PASSED TESTS: (1) Return-holding zone: GET /api/warehouse/dashboard.by_zone shows main (312 cells) and return_holding (8 cells) ✓ GET /api/warehouse/locations?zone=return_holding returns 8 rows (D-10-01..D-10-08) ✓ (2) Return-in allocation: POST movement_type=return_in allocates to return_holding zone (D-10-*) ✓ Dashboard shows return_holding.occupied_pairs increased ✓ (3) Production-in main zone: POST movement_type=production_in allocates to main zone (not D-10-*) ✓ Return_holding unchanged, main increased ✓ (4) Block/unblock: PATCH /api/warehouse/locations/B-01-01/block sets status='blocked' ✓ Sequential allocation SKIPS blocked B-01-01 ✓ Unblock resets status to 'empty' ✓ (5) Operator role: Created operator user ✓ Operator CAN: PATCH picklist, pick-item, read dashboard/locations/picklists/pending-list ✓ Operator CANNOT: POST picklists (403), block locations (403), DELETE picklists (403) ✓ (6) Return_restocked flow: return_in to return_holding, then return_restocked moves to main zone ✓ Dashboard counters updated correctly ✓ (7) Full regression: style → production_in → sku-map → picklist → pick-item → dispatched all working ✓ FAILED TEST: (8) Online order import picklist auto-generation: POST /api/online-orders/import does NOT create picklists automatically even when stock is available. fulfilled_from_stock=0, picklists_created=[] despite 10 pairs in fg_location_inventory. This is a BUG in the WMS integration at lines 5239-5276 in server.py where the fg_location_inventory query is not finding available stock. Root cause unknown - query logic looks correct but not returning results. RECOMMENDATION: Main agent should debug the online order import code to identify why fg_location_inventory query is failing. Add logging to see query results. This is blocking the full WMS integration flow."
