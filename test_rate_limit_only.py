@@ -4,7 +4,7 @@
 import requests
 import time
 
-BASE_URL = "https://bugfix-feature-add.preview.emergentagent.com/api"
+BASE_URL = "https://wms-finished-goods.preview.emergentagent.com/api"
 ADMIN_EMAIL = "admin@example.com"
 
 print("Testing rate limit after backend restart...")

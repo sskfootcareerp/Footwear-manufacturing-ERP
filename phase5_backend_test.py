@@ -18,7 +18,7 @@ import re
 from datetime import datetime
 
 # Backend URL from frontend/.env
-BASE_URL = "https://741ffb95-03d2-4896-ab05-4000786e9ca9.preview.emergentagent.com/api"
+BASE_URL = "https://wms-finished-goods.preview.emergentagent.com/api"
 
 # Test credentials from /app/memory/test_credentials.md
 ADMIN_EMAIL = "admin@example.com"
