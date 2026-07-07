@@ -3564,7 +3564,7 @@ class ListingFormatConfigIn(BaseModel):
     skip_rows_after_header: int = 0
     # canonical field -> actual column name in this platform's export
     # (null when the canonical field is not present in that platform's file)
-    column_map: Dict[str, Optional[str]] = Field(default_factory=dict)
+    column_map: Dict[str, Optional[str]]
     has_native_group_id: bool = False
     active: bool = True
     notes: Optional[str] = ""
