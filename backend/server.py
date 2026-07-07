@@ -3488,6 +3488,301 @@ async def update_color(cid: str, payload: ColorMasterUpdate, request: Request):
     return stringify(fresh)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# ══ LISTING FORMAT REGISTRY ════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# Config-driven registry of platform listing-file formats. Instead of
+# hardcoding parsing logic per platform (Myntra styledashboard sheet name,
+# Ajio's dynamic sheet name pattern, Flipkart's description row after the
+# header, differing column names for the same canonical field), each
+# platform gets ONE config document in `listing_format_configs`. Adding a
+# 5th, 6th, 7th platform later never requires touching parsing code — only
+# adding a config row through the admin UI.
+#
+# Canonical fields (any platform's export must be mappable to these):
+#   group_id            - style+colour grouping id (Myntra "Style Id",
+#                         Ajio "*Style Code"); null when platform has no
+#                         native grouping (Flipkart) — Phase C will derive
+#                         it from leaf_sku + our SKU map.
+#   leaf_sku            - fully-unique per-size code (Myntra "SellerSkuCode",
+#                         Ajio "*Item SKU", Flipkart "Seller SKU Id")
+#   size                - size column when explicit; null when embedded in
+#                         leaf_sku (Myntra, Flipkart)
+#   color_primary       - primary colour column (Myntra "Colour", Ajio
+#                         "*Primary Color")
+#   color_family        - broader colour family (optional; Ajio only)
+#   style_description   - product title/description
+#   mrp                 - MRP column
+#   selling_price       - platform's selling-price column
+#   brand               - brand column
+#   listing_status      - active/inactive/pending flag column
+# ═══════════════════════════════════════════════════════════════════════
+
+Platform = Literal["myntra", "flipkart", "ajio", "nykaa", "website", "other"]
+
+CANONICAL_FIELDS = [
+    "group_id", "leaf_sku", "size",
+    "color_primary", "color_family",
+    "style_description", "mrp", "selling_price",
+    "brand", "listing_status",
+]
+
+
+class SheetLocator(BaseModel):
+    """How to find the data sheet within an uploaded workbook."""
+    type: Literal["fixed_name", "name_contains", "first_sheet"]
+    # for type=fixed_name
+    name: Optional[str] = None
+    # for type=name_contains
+    substring: Optional[str] = None
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, v):
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator("substring")
+    @classmethod
+    def _clean_sub(cls, v):
+        return v.strip() if isinstance(v, str) else v
+
+
+class HeaderLocator(BaseModel):
+    """How to find the header row within the data sheet."""
+    type: Literal["fixed_row", "scan_for_columns"]
+    # for type=fixed_row (0-indexed)
+    row: Optional[int] = None
+    # for type=scan_for_columns — scan the first ~10 rows for a row that
+    # contains AT LEAST ONE of these column names (case-insensitive substring)
+    must_contain_any: Optional[List[str]] = None
+
+
+class ListingFormatConfigIn(BaseModel):
+    platform: Platform
+    sheet_locator: SheetLocator
+    header_locator: HeaderLocator
+    skip_rows_after_header: int = 0
+    # canonical field -> actual column name in this platform's export
+    # (null when the canonical field is not present in that platform's file)
+    column_map: Dict[str, Optional[str]] = Field(default_factory=dict)
+    has_native_group_id: bool = False
+    active: bool = True
+    notes: Optional[str] = ""
+
+    @field_validator("column_map")
+    @classmethod
+    def _validate_column_map(cls, v):
+        if not isinstance(v, dict):
+            raise PydanticCustomError("column_map_type", "column_map must be an object")
+        # unknown canonical fields are allowed (forward-compat for later platforms)
+        # but leaf_sku is REQUIRED — without it there's no per-size row identity
+        if not v.get("leaf_sku"):
+            raise PydanticCustomError(
+                "column_map_leaf_sku",
+                "column_map.leaf_sku is required — every platform must expose the per-size unique SKU column"
+            )
+        return v
+
+
+class ListingFormatConfigUpdate(BaseModel):
+    sheet_locator: Optional[SheetLocator] = None
+    header_locator: Optional[HeaderLocator] = None
+    skip_rows_after_header: Optional[int] = None
+    column_map: Optional[Dict[str, Optional[str]]] = None
+    has_native_group_id: Optional[bool] = None
+    active: Optional[bool] = None
+    notes: Optional[str] = None
+
+    @field_validator("column_map")
+    @classmethod
+    def _validate_column_map_opt(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise PydanticCustomError("column_map_type", "column_map must be an object")
+        if not v.get("leaf_sku"):
+            raise PydanticCustomError(
+                "column_map_leaf_sku",
+                "column_map.leaf_sku is required"
+            )
+        return v
+
+
+DEFAULT_LISTING_FORMAT_CONFIGS = [
+    # ── Myntra ────────────────────────────────────────────────────────
+    # Data lives on the fixed-name sheet "styledashboard"; header on row 0;
+    # no filler row after header. Size is EMBEDDED in SellerSkuCode (e.g.
+    # "CC-058-BR-38"), so column_map.size is null — resolver derives it
+    # via the SKU parser template.
+    {
+        "platform": "myntra",
+        "sheet_locator": {"type": "fixed_name", "name": "styledashboard"},
+        "header_locator": {"type": "fixed_row", "row": 0},
+        "skip_rows_after_header": 0,
+        "column_map": {
+            "group_id":          "Style Id",
+            "leaf_sku":          "SellerSkuCode",
+            "size":              None,
+            "color_primary":     "Colour",
+            "color_family":      None,
+            "style_description": "Style Name",
+            "mrp":               "MRP",
+            "selling_price":     "Selling Price",
+            "brand":             "Brand",
+            "listing_status":    "Listing Status",
+        },
+        "has_native_group_id": True,
+        "active": True,
+        "notes": "Myntra Style Dashboard export. Sheet name is fixed. Size is embedded in SellerSkuCode.",
+    },
+    # ── Ajio ──────────────────────────────────────────────────────────
+    # Sheet name is dynamic per feed/category (e.g. "Women_Styles_20250701"),
+    # so we locate it by substring. Header is on row index 2 (not 0), and
+    # different exports may shift this — so scan the first ~10 rows for a
+    # row containing "*Style Code" / "*Item SKU". Column names include a
+    # leading asterisk in Ajio's template.
+    {
+        "platform": "ajio",
+        "sheet_locator": {"type": "name_contains", "substring": "_Styles_"},
+        "header_locator": {"type": "scan_for_columns", "must_contain_any": ["*Style Code", "*Item SKU", "*Size", "*Primary Color"]},
+        "skip_rows_after_header": 0,
+        "column_map": {
+            "group_id":          "*Style Code",
+            "leaf_sku":          "*Item SKU",
+            "size":              "*Size",
+            "color_primary":     "*Primary Color",
+            "color_family":      "*Color Family",
+            "style_description": "*Product Description",
+            "mrp":               "*MRP",
+            "selling_price":     "*Selling Price",
+            "brand":             "*Brand",
+            "listing_status":    "*Listing Status",
+        },
+        "has_native_group_id": True,
+        "active": True,
+        "notes": "Ajio catalogue export. Sheet name pattern *_Styles_*. Header row may shift — scanner handles rows 0-10.",
+    },
+    # ── Flipkart ──────────────────────────────────────────────────────
+    # Simple single-sheet format; take first sheet. Header on row 0, then
+    # a description row (e.g. "Product Title (max 200 chars)…") immediately
+    # after — skip_rows_after_header=1. No native group id column, so
+    # has_native_group_id=false → Phase C will derive the group from our
+    # SKU map's colour translation.
+    {
+        "platform": "flipkart",
+        "sheet_locator": {"type": "first_sheet"},
+        "header_locator": {"type": "fixed_row", "row": 0},
+        "skip_rows_after_header": 1,
+        "column_map": {
+            "group_id":          None,
+            "leaf_sku":          "Seller SKU Id",
+            "size":              None,
+            "color_primary":     "Color",
+            "color_family":      None,
+            "style_description": "Product Title",
+            "mrp":               "MRP",
+            "selling_price":     "Your Selling Price",
+            "brand":             "Brand",
+            "listing_status":    "Listing Status",
+        },
+        "has_native_group_id": False,
+        "active": True,
+        "notes": "Flipkart Listings export. Row 1 (after header) is a description/hint row and must be skipped. No native group id — derive via SKU map.",
+    },
+]
+
+
+async def _seed_listing_format_configs() -> int:
+    """Idempotently seed listing_format_configs with Myntra/Ajio/Flipkart."""
+    try:
+        await db.listing_format_configs.create_index("platform", unique=True, name="lfc_platform_unique")
+    except Exception as e:
+        log.warning(f"Could not create listing_format_configs index: {e}")
+    inserted = 0
+    for cfg in DEFAULT_LISTING_FORMAT_CONFIGS:
+        existing = await db.listing_format_configs.find_one({"platform": cfg["platform"]})
+        if existing:
+            continue
+        doc = dict(cfg)
+        doc["created_at"] = now_iso()
+        doc["updated_at"] = now_iso()
+        doc["seeded"]     = True
+        await db.listing_format_configs.insert_one(doc)
+        inserted += 1
+    return inserted
+
+
+# ── Endpoints ────────────────────────────────────────────────────────
+@api.get("/listing-format-configs")
+async def list_listing_format_configs(request: Request, active: Optional[bool] = None):
+    """List all platform listing-format configs.
+
+    Any authenticated user can read (needed by pipelines that resolve columns).
+    Only admins can create/update.
+    """
+    await get_current_user(request)
+    q: Dict[str, Any] = {}
+    if active is not None:
+        q["active"] = active
+    docs = await db.listing_format_configs.find(q).sort("platform", 1).to_list(1000)
+    return [stringify(d) for d in docs]
+
+
+@api.get("/listing-format-configs/{platform}")
+async def get_listing_format_config(platform: str, request: Request):
+    await get_current_user(request)
+    doc = await db.listing_format_configs.find_one({"platform": platform.lower()})
+    if not doc:
+        raise HTTPException(404, f"No listing-format config for platform '{platform}'")
+    return stringify(doc)
+
+
+@api.post("/listing-format-configs")
+async def create_listing_format_config(payload: ListingFormatConfigIn, request: Request):
+    u = await get_current_user(request); require_roles("admin")(u)
+    if await db.listing_format_configs.find_one({"platform": payload.platform}):
+        raise HTTPException(409, f"Config for platform '{payload.platform}' already exists — use PUT to update")
+    doc = payload.model_dump()
+    doc["created_at"] = now_iso()
+    doc["updated_at"] = now_iso()
+    doc["seeded"]     = False
+    try:
+        res = await db.listing_format_configs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, f"Config for platform '{payload.platform}' already exists")
+    doc.pop("_id", None)
+    doc["id"] = str(res.inserted_id)
+    await log_activity("listing_format.create", "listing_format_configs",
+                       f"Added listing format config for {payload.platform}", u["email"])
+    return doc
+
+
+@api.put("/listing-format-configs/{platform}")
+async def update_listing_format_config(platform: str, payload: ListingFormatConfigUpdate, request: Request):
+    u = await get_current_user(request); require_roles("admin")(u)
+    platform_lc = platform.lower()
+    existing = await db.listing_format_configs.find_one({"platform": platform_lc})
+    if not existing:
+        raise HTTPException(404, f"No listing-format config for platform '{platform_lc}'")
+    update: Dict[str, Any] = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
+    if not update:
+        return stringify(existing)
+    update["updated_at"] = now_iso()
+    await db.listing_format_configs.update_one({"platform": platform_lc}, {"$set": update})
+    fresh = await db.listing_format_configs.find_one({"platform": platform_lc})
+    await log_activity("listing_format.update", "listing_format_configs",
+                       f"Updated listing format config for {platform_lc}: {', '.join(update.keys())}", u["email"])
+    return stringify(fresh)
+
+
+@api.get("/listing-format-configs/_meta/canonical-fields")
+async def get_canonical_fields(request: Request):
+    """Return the list of canonical field names used in column_map — helps the
+    admin UI render an editable form without hardcoding the schema client-side."""
+    await get_current_user(request)
+    return {"canonical_fields": CANONICAL_FIELDS}
+
+
 # ---------- COSTING (live preview) ----------
 @api.post("/costing/preview")
 async def costing_preview(payload: StyleIn, request: Request):
@@ -8584,6 +8879,13 @@ async def on_startup():
             log.info(f"Color master: seeded {seeded} default colours")
     except Exception as e:
         log.warning(f"Color master seed failed: {e}")
+
+    try:
+        seeded_lfc = await _seed_listing_format_configs()
+        if seeded_lfc:
+            log.info(f"Listing format registry: seeded {seeded_lfc} platform configs (myntra/ajio/flipkart)")
+    except Exception as e:
+        log.warning(f"Listing format registry seed failed: {e}")
     try:
         profile = await db.settings.find_one({"_id": "company_profile"})
         if profile:
